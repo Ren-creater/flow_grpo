@@ -1,0 +1,8 @@
+{
+    "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+    "fsdp_transformer_layer_cls_to_wrap": "JointTransformerBlock",
+    "fsdp_cpu_ram_efficient_loading": true,
+    "fsdp_sync_module_states": true,
+    "fsdp_limit_all_gathers": true,
+    "fsdp_use_orig_params": true
+}

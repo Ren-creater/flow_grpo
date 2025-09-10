@@ -1,0 +1,2 @@
+_target_: src.models.stable_diffusion_3.modeling_sd3_pnt.SD3PredictNextTimeStepModelRLOOWrapper
+pretrained_model_name_or_path: models/stabilityai/stable-diffusion-3-medium-diffusers

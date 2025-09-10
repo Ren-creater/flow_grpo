@@ -1,0 +1,3 @@
+_target_: src.data.hf_dataset.get_hf_json
+json_path:
+  - example/*jsonl

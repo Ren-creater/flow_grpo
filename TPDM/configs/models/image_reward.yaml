@@ -1,0 +1,3 @@
+_target_: src.reward_models.ImageReward.load
+name: models/ImageReward/ImageReward.pt
+med_config: models/ImageReward/med_config.json

@@ -1,0 +1,22 @@
+_target_: src.models.stable_diffusion_3.modeling_sd3_pnt.SD3PredictNextTimeStepModelRLOOWrapper
+pretrained_model_name_or_path: models/stabilityai/stable-diffusion-3.5-medium
+use_vit_predictor: true
+time_predictor_config:
+  num_layers: 8
+  num_heads: 12
+  hidden_size: 768
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attention_dropout: 0.1
+  image_size: 64
+  patch_size: 8
+  in_channels: 3072  # Combined hidden states channels (may need adjustment for SD3.5)
+  text_embed_dim: 1536  # Text embedding dimension (may need adjustment for SD3.5)
+  timestep_embed_dim: 1536  # Timestep embedding dimension
+  projection_dim: 2
+  init_alpha: 2.0
+  init_beta: 1.0
+  epsilon: 1.0
+  use_text_conditioning: true
+  use_timestep_conditioning: true
+  cross_attention: true

@@ -1,0 +1,2 @@
+_target_: src.data.data_collator.json_prompt_collate_fn
+_partial_: True
