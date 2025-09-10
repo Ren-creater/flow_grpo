@@ -5,8 +5,8 @@ import torch
 class PickScoreScorer(torch.nn.Module):
     def __init__(self, device="cuda", dtype=torch.float32):
         super().__init__()
-        processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-        model_path = "yuvalkirstain/PickScore_v1"
+        processor_path = "/rds/general/user/zr523/home/flow_grpo/CLIP-ViT-H-14-laion2B-s32B-b79K" #"laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+        model_path = "/rds/general/user/zr523/home/flow_grpo/PickScore_v1" #"yuvalkirstain/PickScore_v1"
         self.device = device
         self.dtype = dtype
         self.processor = CLIPProcessor.from_pretrained(processor_path)
