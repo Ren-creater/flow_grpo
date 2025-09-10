@@ -588,7 +588,7 @@ def pickscore_sd3_pnt():
     return config
 
 def general_ocr_sd3_pnt_1gpu():
-    config = pickscore_sd3_pnt()
+    config = general_ocr_sd3_1gpu()
     # sd3 medium (not 3.5) - local path
     config.pretrained.model = "/rds/general/user/zr523/home/flow_grpo/TPDM/models/stabilityai/stable-diffusion-3-medium"
     config.save_dir = 'logs/pickscore/sd3-M-pnt-4gpu'

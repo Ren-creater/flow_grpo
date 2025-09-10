@@ -9,10 +9,6 @@ conda install nvidia::cuda-nvcc
 
 cd ~/flow_grpo
 
-export NCCL_BLOCKING_WAIT=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=3600  # 2 hours instead of 30 minutes
-
 export WANDB_API_KEY="ceaaf9b7ea779499fff2a3a9b02dccab03b0c043"
 
 accelerate launch --config_file scripts/accelerate_configs/deepspeed_zero3.yaml \
