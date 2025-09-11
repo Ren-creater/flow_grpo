@@ -222,6 +222,12 @@ def pipeline_with_logprob(
     image = self.vae.decode(latents, return_dict=False)[0]
     image = self.image_processor.postprocess(image, output_type=output_type)
 
+    # Store sigma progression for each timestep to be used later in compute_log_prob
+    # We need this information to properly compute log probabilities during training
+    all_sigmas_per_step = []
+    for i, sigma_tensor in enumerate(self.scheduler.sigmas):
+        all_sigmas_per_step.append(sigma_tensor.clone())
+
     # Offload all models (try alternative if maybe_free_model_hooks doesn't exist)
     if hasattr(self, 'maybe_free_model_hooks'):
         self.maybe_free_model_hooks()
@@ -239,4 +245,4 @@ def pipeline_with_logprob(
             self.text_encoder_3.to('cpu')
 
 
-    return image, all_latents, all_log_probs, timesteps_per_sample
+    return image, all_latents, all_log_probs, timesteps_per_sample, all_sigmas_per_step

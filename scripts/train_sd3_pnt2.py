@@ -182,6 +182,40 @@ def create_generator(prompts, base_seed):
 
         
 def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
+    # Set up scheduler state for sde_step_with_logprob
+    current_batch_size = sample["latents"].shape[0]
+    current_timesteps = sample["timesteps"][:, j]  # timesteps for step j across current batch
+    current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
+    next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
+    
+    # Ensure all tensors are on the correct device
+    device = sample["latents"].device
+    current_timesteps = current_timesteps.to(device)
+    current_sigmas = current_sigmas.to(device)
+    next_sigmas = next_sigmas.to(device)
+    
+    # Create the scheduler state that sde_step_with_logprob expects
+    pipeline.scheduler.index_for_timestep = [{} for _ in range(current_batch_size)]
+    
+    # Set up the mapping for the current timestep
+    for batch_idx in range(current_batch_size):
+        timestep_val = current_timesteps[batch_idx].item()
+        pipeline.scheduler.index_for_timestep[batch_idx][timestep_val] = j
+    
+    # Set up sigmas list where sigmas[step][batch_idx] gives the sigma value
+    # We need at least steps j and j+1, plus sigma[1] for sigma_max
+    max_step = max(j + 1, 1)
+    pipeline.scheduler.sigmas = [torch.zeros(current_batch_size, device=device) for _ in range(max_step + 1)]
+    pipeline.scheduler.sigmas[j] = current_sigmas
+    pipeline.scheduler.sigmas[j + 1] = next_sigmas
+    
+    # Extract sigma_max from the sample's sigmas - use step 1 sigmas as sigma_max
+    if sample["sigmas"].shape[1] > 1:
+        sigma_max = sample["sigmas"][:, 1].to(device)  # Use second timestep sigmas as sigma_max
+    else:
+        sigma_max = torch.ones_like(current_sigmas)
+    pipeline.scheduler.sigmas[1] = sigma_max
+    
     if config.train.cfg:
         noise_pred = transformer(
             hidden_states=torch.cat([sample["latents"][:, j]] * 2),
@@ -247,7 +281,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -381,7 +415,7 @@ def main(_):
         config.pretrained.model
     )    
 
-    init_time_predictor(pipeline, config.sd3_checkpoint_path)
+    init_time_predictor(pipeline, config.sd3_checkpoint_path, use_vit_predictor=config.use_vit_predictor)
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
@@ -641,7 +675,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, timesteps_per_sample = pipeline_with_logprob(
+                    images, latents, log_probs, timesteps_per_sample, all_sigmas_per_step = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -661,10 +695,14 @@ def main(_):
             )  # (batch_size, num_steps + 1, 16, 96, 96)
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
 
+            # Stack sigmas to match timesteps and latents structure
+            # all_sigmas_per_step contains sigma values for each step, we need to stack them
+            sigmas = torch.stack(all_sigmas_per_step, dim=1)  # (batch_size, num_steps + 1)
+
             # timesteps = pipeline.scheduler.timesteps.repeat(
             #     config.sample.train_batch_size, 1
             # )  # (batch_size, num_steps)
-            timesteps = pipeline.scheduler.timesteps
+            timesteps = torch.stack(pipeline.scheduler.timesteps, dim=1)
 
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
@@ -686,6 +724,7 @@ def main(_):
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
+                    "sigmas": sigmas,  # sigma values for each timestep
                 }
             )
 
