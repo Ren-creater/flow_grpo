@@ -251,9 +251,9 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, all_trainable_parameters):
     if config.train.ema:
-        ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+        ema.copy_ema_to(all_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
@@ -350,23 +350,26 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                 step=global_step,
             )
     if config.train.ema:
-        ema.copy_temp_to(transformer_trainable_parameters)
+        ema.copy_temp_to(all_trainable_parameters)
 
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
     model = model._orig_mod if is_compiled_module(model) else model
     return model
 
-def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config):
+def save_ckpt(save_dir, transformer, pipeline, global_step, accelerator, ema, all_trainable_parameters, config):
     save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
     save_root_lora = os.path.join(save_root, "lora")
     os.makedirs(save_root_lora, exist_ok=True)
     if accelerator.is_main_process:
         if config.train.ema:
-            ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+            ema.copy_ema_to(all_trainable_parameters, store_temp=True)
         unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
+        # Save time_predictor weights
+        time_predictor_path = os.path.join(save_root, "time_predictor.pt")
+        torch.save(unwrap_model(pipeline.time_predictor, accelerator).state_dict(), time_predictor_path)
         if config.train.ema:
-            ema.copy_temp_to(transformer_trainable_parameters)
+            ema.copy_temp_to(all_trainable_parameters)
 
 def main(_):
     # basic Accelerate and logging setup
@@ -474,8 +477,10 @@ def main(_):
     
     transformer = pipeline.transformer
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    time_predictor_parameters = list(pipeline.time_predictor.parameters())
+    all_trainable_parameters = transformer_trainable_parameters + time_predictor_parameters
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
-    ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
+    ema = EMAModuleWrapper(all_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
     
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -496,7 +501,7 @@ def main(_):
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        transformer_trainable_parameters,
+        all_trainable_parameters,
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
@@ -589,7 +594,10 @@ def main(_):
     # autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    transformer, time_predictor, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, pipeline.time_predictor, optimizer, train_dataloader, test_dataloader)
+    
+    # Reassign the prepared time_predictor back to pipeline
+    pipeline.time_predictor = time_predictor
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
@@ -635,9 +643,9 @@ def main(_):
         pipeline.transformer.eval()
         pipeline.time_predictor.eval()
         if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, all_trainable_parameters)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+            save_ckpt(config.save_dir, transformer, pipeline, global_step, accelerator, ema, all_trainable_parameters, config)
 
         #################### SAMPLING ####################-
         pipeline.transformer.eval()
@@ -1011,7 +1019,7 @@ def main(_):
                         global_step += 1
                         info = defaultdict(list)
                 if config.train.ema:
-                    ema.step(transformer_trainable_parameters, global_step)
+                    ema.step(all_trainable_parameters, global_step)
             # make sure we did an optimization step at the end of the inner epoch
             # assert accelerator.sync_gradients
         
