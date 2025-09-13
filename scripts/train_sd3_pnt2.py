@@ -786,7 +786,6 @@ def main(_):
             # For full fine-tuning, unfreeze all transformer parameters
             for param in transformer.parameters():
                 param.requires_grad = True
-    
     def create_time_predictor_only_optimizer():
         """Create optimizer for time_predictor-only training"""
         return optimizer_cls(
@@ -940,7 +939,7 @@ def main(_):
 
     while True:
         # Handle time_predictor-only training phase
-        time_predictor_only_epochs = getattr(config.train, 'time_predictor_only_epochs', 0)
+        time_predictor_only_epochs = config.train.time_predictor_only_epochs
         is_time_predictor_only_phase = epoch < time_predictor_only_epochs
         
         # Switch from time_predictor-only to full training if needed
@@ -1416,8 +1415,6 @@ def main(_):
                 ):
                     with accelerator.accumulate(transformer):
                         with autocast():
-                            # Compute diffusion model logprobs (only if not in time_predictor-only phase or if using joint training)
-                            is_time_predictor_only_phase = epoch < config.train.get('time_predictor_only_epochs', 0)
                             
                             if not is_time_predictor_only_phase:
                                 # Full joint training: compute both diffusion and time predictor logprobs
