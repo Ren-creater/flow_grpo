@@ -15,6 +15,7 @@ from diffusers import StableDiffusion3Pipeline
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../TPDM/src")))
 from models.stable_diffusion_3.modeling_sd3_pnt import init_time_predictor
+from models.reference_distributions import get_ref_beta
 from diffusers.utils.torch_utils import is_compiled_module
 import numpy as np
 import flow_grpo.prompts
@@ -251,9 +252,139 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, all_trainable_parameters):
+def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config):
+    """
+    Compute the log probability of the time predictor for step j.
+    This function uses the saved hidden states and temporal embeddings to recompute
+    the time predictor logprob for a specific sigma transition.
+    """
+    current_batch_size = sample["latents"].shape[0]
+    device = sample["latents"].device
+    
+    # Get current and next sigmas for this timestep
+    current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
+    next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
+    
+    # Use stored hidden states and temporal embeddings from the sampling phase
+    hidden_states_combined = sample["hidden_states_combineds"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    temb = sample["tembs"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    
+    # Call the time predictor to get alpha and beta
+    time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+    
+    time_predictor_log_probs = torch.zeros(current_batch_size, device=device)
+    
+    for i, (param1, param2) in enumerate(time_preds):
+        # Skip log prob computation if sigma is below threshold (following modeling_sd3_pnt.py pattern)
+        if current_sigmas[i] < pipeline.min_sigma:
+            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            continue
+            
+        if pipeline.prediction_type == "alpha_beta":
+            alpha, beta = param1, param2
+        elif pipeline.prediction_type == "mode_concentration":
+            alpha = param1 * (param2 - 2) + 1
+            beta = (1 - param1) * (param2 - 2) + 1
+        
+        beta_dist = torch.distributions.Beta(alpha, beta)
+        
+        # Calculate the ratio from the stored sigmas
+        if pipeline.relative:
+            # Check for division by zero or invalid values
+            if current_sigmas[i] == 0 or torch.isnan(current_sigmas[i]) or torch.isnan(next_sigmas[i]):
+                time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+                continue
+            ratio = next_sigmas[i] / current_sigmas[i]
+        else:
+            # Check for invalid values in non-relative case
+            if torch.isnan(current_sigmas[i]) or torch.isnan(next_sigmas[i]):
+                time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+                continue
+            ratio = current_sigmas[i] - next_sigmas[i]
+        
+        # Check if ratio is NaN or inf before clamping
+        if torch.isnan(ratio) or torch.isinf(ratio):
+            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            continue
+            
+        ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
+        
+        # Compute the log probability
+        time_predictor_log_prob = beta_dist.log_prob(ratio)
+        time_predictor_log_probs[i] = time_predictor_log_prob
+    
+    return time_predictor_log_probs
+
+def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config):
+    """
+    Compute the KL divergence between the time predictor's predicted Beta distribution
+    and a reference Beta distribution for step j.
+    """
+    current_batch_size = sample["latents"].shape[0]
+    device = sample["latents"].device
+    
+    # Get current sigmas for this timestep to compute reference distribution
+    current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
+    
+    # Use stored hidden states and temporal embeddings from the sampling phase
+    hidden_states_combined = sample["hidden_states_combineds"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    temb = sample["tembs"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    
+    # Call the time predictor to get alpha and beta
+    time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+    
+    kl_divergences = torch.zeros(current_batch_size, device=device)
+    
+    for i, (param1, param2) in enumerate(time_preds):
+        # Skip KL computation if sigma is below threshold (following modeling_sd3_pnt.py pattern)
+        if current_sigmas[i] < pipeline.min_sigma:
+            kl_divergences[i] = torch.tensor(0.0, device=device)
+            continue
+            
+        if pipeline.prediction_type == "alpha_beta":
+            alpha, beta = param1, param2
+        elif pipeline.prediction_type == "mode_concentration":
+            alpha = param1 * (param2 - 2) + 1
+            beta = (1 - param1) * (param2 - 2) + 1
+        
+        # Get reference distribution parameters using the same logic as in modeling_sd3_pnt.py
+        if pipeline.relative:
+            # Use the get_ref_beta function to get reference alpha/beta based on current sigma
+            # Reshape sigma for get_ref_beta function (expects 1D tensor)
+            sigma_input = current_sigmas[i:i+1]  # Shape: (1,)
+            ref_alpha, ref_beta = get_ref_beta(sigma_input)
+            ref_alpha, ref_beta = ref_alpha[0], ref_beta[0]  # Extract scalar values
+        else:
+            # Use fixed reference distribution for non-relative case
+            ref_alpha, ref_beta = 1.4, 11.2
+        
+        # Validate and clamp all parameters to ensure they're valid for Beta distribution
+        alpha = torch.clamp(alpha, min=1e-6)
+        beta = torch.clamp(beta, min=1e-6)
+        ref_alpha = torch.clamp(ref_alpha, min=1e-6)
+        ref_beta = torch.clamp(ref_beta, min=1e-6)
+        
+        # Check for any invalid values (NaN, inf)
+        if torch.isnan(alpha) or torch.isinf(alpha) or torch.isnan(beta) or torch.isinf(beta) or \
+           torch.isnan(ref_alpha) or torch.isinf(ref_alpha) or torch.isnan(ref_beta) or torch.isinf(ref_beta):
+            kl_div = torch.tensor(0.0, device=device)
+        else:
+            # Create distributions and compute KL divergence
+            predicted_dist = torch.distributions.Beta(alpha, beta)
+            ref_dist = torch.distributions.Beta(ref_alpha, ref_beta)
+            kl_div = torch.distributions.kl_divergence(predicted_dist, ref_dist)
+            # Final check for NaN/inf in the result
+            if torch.isnan(kl_div) or torch.isinf(kl_div):
+                kl_div = torch.tensor(0.0, device=device)
+        
+        kl_divergences[i] = kl_div
+    
+    return kl_divergences
+
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, get_trainable_params_fn):
     if config.train.ema:
-        ema.copy_ema_to(all_trainable_parameters, store_temp=True)
+        current_trainable_params = get_trainable_params_fn()
+        ema.copy_ema_to(current_trainable_params, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
@@ -281,7 +412,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -350,26 +481,36 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                 step=global_step,
             )
     if config.train.ema:
-        ema.copy_temp_to(all_trainable_parameters)
+        ema.copy_temp_to(current_trainable_params)
 
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
     model = model._orig_mod if is_compiled_module(model) else model
     return model
 
-def save_ckpt(save_dir, transformer, pipeline, global_step, accelerator, ema, all_trainable_parameters, config):
+def save_ckpt(save_dir, transformer, pipeline, global_step, accelerator, ema, get_trainable_params_fn, config, is_time_predictor_only_phase=False):
     save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
     save_root_lora = os.path.join(save_root, "lora")
     os.makedirs(save_root_lora, exist_ok=True)
     if accelerator.is_main_process:
         if config.train.ema:
-            ema.copy_ema_to(all_trainable_parameters, store_temp=True)
-        unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
-        # Save time_predictor weights
+            current_trainable_params = get_trainable_params_fn()
+            ema.copy_ema_to(current_trainable_params, store_temp=True)
+        
+        # Only save transformer if it's being trained (not in time_predictor-only phase)
+        if not is_time_predictor_only_phase:
+            unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
+            logger.info(f"Saved transformer weights to {save_root_lora}")
+        else:
+            logger.info(f"Skipping transformer save during time_predictor-only training phase")
+        
+        # Always save time_predictor weights (it's being trained in both phases)
         time_predictor_path = os.path.join(save_root, "time_predictor.pt")
         torch.save(unwrap_model(pipeline.time_predictor, accelerator).state_dict(), time_predictor_path)
+        logger.info(f"Saved time_predictor weights to {time_predictor_path}")
+        
         if config.train.ema:
-            ema.copy_temp_to(all_trainable_parameters)
+            ema.copy_temp_to(current_trainable_params)
 
 def main(_):
     # basic Accelerate and logging setup
@@ -390,15 +531,23 @@ def main(_):
         total_limit=config.num_checkpoint_limit,
     )
 
-    accelerator = Accelerator(
-        # log_with="wandb",
-        mixed_precision=config.mixed_precision,
-        project_config=accelerator_config,
-        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
-        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
-        # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
-    )
+    # Check if we need special DDP handling for time_predictor-only training
+    time_predictor_only_epochs = getattr(config.train, 'time_predictor_only_epochs', 0)
+    
+    # Prepare kwargs for Accelerator initialization
+    accelerator_kwargs = {
+        "mixed_precision": config.mixed_precision,
+        "project_config": accelerator_config,
+        "gradient_accumulation_steps": config.train.gradient_accumulation_steps * num_train_timesteps,
+    }
+    
+    # Add DDP kwargs if we have time_predictor-only training
+    if time_predictor_only_epochs > 0:
+        from accelerate.utils import DistributedDataParallelKwargs
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+
+    accelerator = Accelerator(**accelerator_kwargs)
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
@@ -447,8 +596,11 @@ def main(_):
     pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder_3.to(accelerator.device, dtype=inference_dtype)
     
+    # Move transformer to device but keep in original precision
+    # Mixed precision will be handled by autocast during forward passes
     pipeline.transformer.to(accelerator.device)
-    pipeline.time_predictor.to(accelerator.device)
+    # Keep time_predictor in float32 for training stability
+    pipeline.time_predictor.to(accelerator.device, dtype=torch.float32)
 
     if config.use_lora:
         # Set correct lora layers
@@ -507,6 +659,86 @@ def main(_):
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
+
+    # Helper functions for time_predictor-only training
+    # 
+    # TIME_PREDICTOR-ONLY TRAINING FEATURE:
+    # This feature allows training only the time_predictor for the first few epochs while keeping
+    # the rest of the model (transformer) frozen. This can be useful for:
+    # 1. Warm-up phase: Let time_predictor learn basic time dynamics before joint training
+    # 2. Faster experimentation: Test time_predictor changes without expensive transformer training
+    # 3. Stability: Ensure time_predictor is reasonably trained before full model training
+    #
+    # Configuration:
+    # - Set config.train.time_predictor_only_epochs = N (where N > 0) to enable this feature
+    # - Set config.train.time_predictor_only_epochs = 0 to disable (default)
+    #
+    # TIME_PREDICTOR KL REGULARIZATION:
+    # KL regularization encourages the time predictor's Beta distributions to stay close to
+    # a reference distribution based on the original scheduler dynamics. This helps:
+    # 1. Prevent the time predictor from making extreme predictions
+    # 2. Maintain reasonable timestep transitions
+    # 3. Stabilize training by providing a prior over time dynamics
+    #
+    # Configuration:
+    # - Set config.train.time_predictor_kl_weight = 0.01 (or desired value) to control strength
+    # - Set config.train.time_predictor_kl_weight = 0.0 to disable KL regularization
+    #
+    # During time_predictor-only phase:
+    # - Only time_predictor parameters have requires_grad=True
+    # - Optimizer contains only time_predictor parameters
+    # - Checkpoints save only time_predictor weights (transformer is skipped)
+    # - WandB logging includes "time_predictor_only_phase" flag
+    # - Both GRPO loss and KL regularization are applied to time_predictor
+    #
+    # At transition (epoch == time_predictor_only_epochs):
+    # - Saves final time_predictor-only checkpoint
+    # - Unfreezes transformer parameters (LoRA or full based on config.use_lora)
+    # - Creates new optimizer with all trainable parameters
+    # - Note: Optimizer state is lost during transition
+    #
+    def get_current_trainable_parameters():
+        """Get current trainable parameters based on the training phase"""
+        current_transformer_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+        return current_transformer_params + time_predictor_parameters
+    
+    def freeze_transformer():
+        """Freeze transformer parameters for time_predictor-only training"""
+        for param in transformer.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_transformer():
+        """Unfreeze transformer parameters after time_predictor-only training"""
+        if config.use_lora:
+            # For LoRA, only unfreeze LoRA parameters
+            for param in transformer.parameters():
+                if hasattr(param, 'is_lora') and param.is_lora:
+                    param.requires_grad = True
+        else:
+            # For full fine-tuning, unfreeze all transformer parameters
+            for param in transformer.parameters():
+                param.requires_grad = True
+    
+    def create_time_predictor_only_optimizer():
+        """Create optimizer for time_predictor-only training"""
+        return optimizer_cls(
+            time_predictor_parameters,
+            lr=config.train.learning_rate,
+            betas=(config.train.adam_beta1, config.train.adam_beta2),
+            weight_decay=config.train.adam_weight_decay,
+            eps=config.train.adam_epsilon,
+        )
+    
+    def create_full_optimizer():
+        """Create optimizer for full training (transformer + time_predictor)"""
+        current_trainable = list(filter(lambda p: p.requires_grad, transformer.parameters())) + time_predictor_parameters
+        return optimizer_cls(
+            current_trainable,
+            lr=config.train.learning_rate,
+            betas=(config.train.adam_beta1, config.train.adam_beta2),
+            weight_decay=config.train.adam_weight_decay,
+            eps=config.train.adam_epsilon,
+        )
 
     # prepare prompt and reward fn
     reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
@@ -639,13 +871,55 @@ def main(_):
     train_iter = iter(train_dataloader)
 
     while True:
+        # Handle time_predictor-only training phase
+        time_predictor_only_epochs = getattr(config.train, 'time_predictor_only_epochs', 0)
+        is_time_predictor_only_phase = epoch < time_predictor_only_epochs
+        
+        # Switch from time_predictor-only to full training if needed
+        if epoch == time_predictor_only_epochs and time_predictor_only_epochs > 0:
+            logger.info(f"Switching from time_predictor-only to full training at epoch {epoch}")
+            
+            # Save checkpoint before switching (time_predictor-only final state)
+            if accelerator.is_main_process:
+                save_ckpt(config.save_dir, transformer, pipeline, global_step, accelerator, ema, get_current_trainable_parameters, config, is_time_predictor_only_phase=True)
+                logger.info("Saved time_predictor-only checkpoint before switching to full training")
+            
+            # Unfreeze transformer parameters
+            unfreeze_transformer()
+            # Create new optimizer with all trainable parameters
+            new_optimizer = create_full_optimizer()
+            # Replace the old optimizer (note: this will lose optimizer state)
+            optimizer = new_optimizer
+            # Re-prepare the optimizer with accelerator
+            optimizer = accelerator.prepare(optimizer)
+            
+            # Re-initialize EMA with new parameter set
+            new_trainable_params = get_current_trainable_parameters()
+            ema = EMAModuleWrapper(new_trainable_params, decay=0.9, update_step_interval=8, device=accelerator.device)
+            logger.info("Successfully switched to full training mode and re-initialized EMA")
+        
+        # For epoch 0 in time_predictor_only mode, freeze transformer
+        if epoch == 0 and time_predictor_only_epochs > 0:
+            logger.info(f"Starting time_predictor-only training for {time_predictor_only_epochs} epochs")
+            freeze_transformer()
+            # Create time_predictor-only optimizer
+            time_predictor_optimizer = create_time_predictor_only_optimizer()
+            # Replace the optimizer
+            optimizer = time_predictor_optimizer
+            # Re-prepare the optimizer with accelerator
+            optimizer = accelerator.prepare(optimizer)
+            
+            # Re-initialize EMA with only time_predictor parameters
+            ema = EMAModuleWrapper(time_predictor_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
+            logger.info("Successfully switched to time_predictor-only training mode and re-initialized EMA")
+
         #################### EVAL ####################
         pipeline.transformer.eval()
         pipeline.time_predictor.eval()
         if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, all_trainable_parameters)
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, get_current_trainable_parameters)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-            save_ckpt(config.save_dir, transformer, pipeline, global_step, accelerator, ema, all_trainable_parameters, config)
+            save_ckpt(config.save_dir, transformer, pipeline, global_step, accelerator, ema, get_current_trainable_parameters, config, is_time_predictor_only_phase)
 
         #################### SAMPLING ####################-
         pipeline.transformer.eval()
@@ -683,7 +957,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, timesteps_per_sample, all_sigmas_per_step = pipeline_with_logprob(
+                    images, latents, log_probs, time_predictor_log_probs, timesteps_per_sample, all_sigmas_per_step, hidden_states_combineds, tembs = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -702,6 +976,7 @@ def main(_):
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 16, 96, 96)
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+            time_predictor_log_probs = torch.stack(time_predictor_log_probs, dim=1)  # shape after stack (batch_size, num_steps)
 
             # Stack sigmas to match timesteps and latents structure
             # all_sigmas_per_step contains sigma values for each step, we need to stack them
@@ -731,6 +1006,9 @@ def main(_):
                         :, 1:
                     ],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
+                    "time_predictor_log_probs": time_predictor_log_probs,
+                    "hidden_states_combineds": hidden_states_combineds,
+                    "tembs": tembs,
                     "rewards": rewards,
                     "sigmas": sigmas,  # sigma values for each timestep
                 }
@@ -749,6 +1027,46 @@ def main(_):
                 key: torch.as_tensor(value, device=accelerator.device).float()
                 for key, value in rewards.items()
             }
+
+        # Pad tensors to the same length before collation to handle variable timesteps
+        max_timesteps = max(s["latents"].shape[1] for s in samples)
+        
+        for sample in samples:
+            current_timesteps = sample["latents"].shape[1]
+            if current_timesteps < max_timesteps:
+                pad_size = max_timesteps - current_timesteps
+                # Pad latents, next_latents, log_probs, timesteps, and sigmas
+                for key in ["latents", "next_latents"]:
+                    if key in sample:
+                        # Pad with zeros for latents
+                        pad_shape = [sample[key].shape[0], pad_size] + list(sample[key].shape[2:])
+                        pad_tensor = torch.zeros(pad_shape, device=sample[key].device, dtype=sample[key].dtype)
+                        sample[key] = torch.cat([sample[key], pad_tensor], dim=1)
+                
+                # Pad log_probs and time_predictor_log_probs with zeros
+                for logprob_key in ["log_probs", "time_predictor_log_probs"]:
+                    if logprob_key in sample:
+                        pad_shape = [sample[logprob_key].shape[0], pad_size]
+                        pad_tensor = torch.zeros(pad_shape, device=sample[logprob_key].device, dtype=sample[logprob_key].dtype)
+                        sample[logprob_key] = torch.cat([sample[logprob_key], pad_tensor], dim=1)
+                
+                # Pad hidden_states_combineds and tembs 
+                for tensor_key in ["hidden_states_combineds", "tembs"]:
+                    if tensor_key in sample:
+                        # Pad with zeros, matching the shape of existing tensors
+                        pad_shape = [sample[tensor_key].shape[0], pad_size] + list(sample[tensor_key].shape[2:])
+                        pad_tensor = torch.zeros(pad_shape, device=sample[tensor_key].device, dtype=sample[tensor_key].dtype)
+                        sample[tensor_key] = torch.cat([sample[tensor_key], pad_tensor], dim=1)
+                
+                # Pad timesteps - use the last timestep value for padding
+                if "timesteps" in sample:
+                    last_timestep = sample["timesteps"][:, -1:].repeat(1, pad_size)
+                    sample["timesteps"] = torch.cat([sample["timesteps"], last_timestep], dim=1)
+                
+                # Pad sigmas - use the last sigma value for padding  
+                if "sigmas" in sample:
+                    last_sigma = sample["sigmas"][:, -1:].repeat(1, pad_size)
+                    sample["sigmas"] = torch.cat([sample["sigmas"], last_sigma], dim=1)
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
@@ -803,6 +1121,7 @@ def main(_):
             wandb.log(
                 {
                     "epoch": epoch,
+                    "time_predictor_only_phase": is_time_predictor_only_phase,
                     **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
                 },
                 step=global_step,
@@ -871,20 +1190,42 @@ def main(_):
                 step=global_step,
             )
         # Filter out samples where the entire time dimension of advantages is zero
-        samples = {k: v[mask] for k, v in samples.items()}
+        # Handle device mismatch: some tensors are on CPU (hidden_states_combineds, tembs) due to memory optimization
+        # Convert mask to CPU once to avoid repeated transfers
+        cpu_mask = mask.cpu()
+        filtered_samples = {}
+        for k, v in samples.items():
+            if k in ["hidden_states_combineds", "tembs"]:
+                # These tensors are on CPU, so use CPU mask
+                filtered_samples[k] = v[cpu_mask]
+            else:
+                # Other tensors are on GPU, use GPU mask
+                filtered_samples[k] = v[mask]
+        samples = filtered_samples
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         # assert (
         #     total_batch_size
         #     == config.sample.train_batch_size * config.sample.num_batches_per_epoch
         # )
-        assert num_timesteps == config.sample.num_steps
+        #assert num_timesteps == config.sample.num_steps
 
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
-            samples = {k: v[perm] for k, v in samples.items()}
+            cpu_perm = perm.cpu()  # Create CPU version for CPU tensors
+            
+            # Handle device mismatch for shuffling
+            shuffled_samples = {}
+            for k, v in samples.items():
+                if k in ["hidden_states_combineds", "tembs"]:
+                    # These tensors are on CPU, so use CPU permutation
+                    shuffled_samples[k] = v[cpu_perm]
+                else:
+                    # Other tensors are on GPU, use GPU permutation
+                    shuffled_samples[k] = v[perm]
+            samples = shuffled_samples
 
             # rebatch for training
             samples_batched = {
@@ -933,14 +1274,42 @@ def main(_):
                 ):
                     with accelerator.accumulate(transformer):
                         with autocast():
-                            prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
-                            if config.train.beta > 0:
-                                with torch.no_grad():
-                                    with transformer.module.disable_adapter():
-                                        _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            # Compute diffusion model logprobs (only if not in time_predictor-only phase or if using joint training)
+                            is_time_predictor_only_phase = epoch < config.train.get('time_predictor_only_epochs', 0)
+                            
+                            if not is_time_predictor_only_phase:
+                                # Full joint training: compute both diffusion and time predictor logprobs
+                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                                if config.train.beta > 0:
+                                    with torch.no_grad():
+                                        with transformer.module.disable_adapter():
+                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            else:
+                                # Time predictor only: skip diffusion logprob computation for efficiency
+                                diffusion_log_prob = torch.zeros_like(sample["log_probs"][:, j])
+                                prev_sample_mean = None
+                                std_dev_t = None
+                                prev_sample_mean_ref = None
+                            
+                            # Always compute time predictor logprobs (this is what we're training)
+                            time_predictor_log_prob = compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config)
+                            
+                            # Compute time predictor KL divergence for regularization
+                            time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
 
                         # Create mask for active samples at this timestep
                         active_mask = (j < timesteps_per_sample).float()  # Shape: (batch_size,)
+                        
+                        # Combine logprobs: diffusion logprobs + time predictor logprobs
+                        if is_time_predictor_only_phase:
+                            # In time_predictor-only phase: only use time predictor logprobs
+                            # Since diffusion model is frozen, diffusion logprobs cancel out in the ratio
+                            current_log_prob = time_predictor_log_prob
+                            reference_log_prob = sample["time_predictor_log_probs"][:, j] 
+                        else:
+                            # In joint training: combine both logprobs
+                            current_log_prob = diffusion_log_prob + time_predictor_log_prob
+                            reference_log_prob = sample["log_probs"][:, j] + sample["time_predictor_log_probs"][:, j]
                         
                         # grpo logic
                         advantages = torch.clamp(
@@ -948,7 +1317,7 @@ def main(_):
                             -config.train.adv_clip_max,
                             config.train.adv_clip_max,
                         )
-                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
+                        ratio = torch.exp(current_log_prob - reference_log_prob)
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,
@@ -961,17 +1330,28 @@ def main(_):
                         # Element-wise division by timesteps per sample, then batch mean
                         policy_loss = torch.mean(sample_losses / timesteps_per_sample.float())
                         
-                        if config.train.beta > 0:
+                        # Compute KL losses
+                        loss = policy_loss
+                        
+                        # Add diffusion model KL regularization (only in joint training phase)
+                        if config.train.beta > 0 and not is_time_predictor_only_phase:
                             kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
                             kl_sample_losses = kl_loss.squeeze() * active_mask
                             # Element-wise division by timesteps per sample, then batch mean
-                            kl_loss = torch.mean(kl_sample_losses / timesteps_per_sample.float())
-                            loss = policy_loss + config.train.beta * kl_loss
-                        else:
-                            loss = policy_loss
+                            diffusion_kl_loss = torch.mean(kl_sample_losses / timesteps_per_sample.float())
+                            loss = loss + config.train.beta * diffusion_kl_loss
+                        
+                        # Add time predictor KL regularization (always active when training time predictor)
+                        # Configuration: Set config.train.time_predictor_kl_weight = 0.01 (or desired value) 
+                        # to control the strength of time predictor KL regularization
+                        time_predictor_kl_weight = getattr(config.train, 'time_predictor_kl_weight', 0.01)  # Default weight
+                        if time_predictor_kl_weight > 0:
+                            time_predictor_kl_sample_losses = time_predictor_kl_div * active_mask
+                            time_predictor_kl_loss = torch.mean(time_predictor_kl_sample_losses / timesteps_per_sample.float())
+                            loss = loss + time_predictor_kl_weight * time_predictor_kl_loss
 
                         # Apply mask first, then compute mean over active entries only
-                        masked_log_prob_diff = (log_prob - sample["log_probs"][:, j]) ** 2 * active_mask
+                        masked_log_prob_diff = (current_log_prob - reference_log_prob) ** 2 * active_mask
                         info["approx_kl"].append(
                             0.5 * torch.sum(masked_log_prob_diff) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
                         )
@@ -991,8 +1371,20 @@ def main(_):
                             torch.sum(masked_clipfrac_lt_one) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
                         )
                         info["policy_loss"].append(policy_loss)
-                        if config.train.beta > 0:
-                            info["kl_loss"].append(kl_loss)
+                        if config.train.beta > 0 and not is_time_predictor_only_phase:
+                            info["diffusion_kl_loss"].append(diffusion_kl_loss)
+                        
+                        # Always log time predictor KL loss when weight > 0
+                        if time_predictor_kl_weight > 0:
+                            info["time_predictor_kl_loss"].append(time_predictor_kl_loss)
+                            info["time_predictor_kl_div_mean"].append(time_predictor_kl_div.mean())
+                            info["time_predictor_kl_div_max"].append(time_predictor_kl_div.max())
+                        
+                        # Track separate logprob components for debugging
+                        if not is_time_predictor_only_phase:
+                            info["diffusion_log_prob_mean"].append(diffusion_log_prob.mean())
+                        info["time_predictor_log_prob_mean"].append(time_predictor_log_prob.mean())
+                        info["combined_log_prob_mean"].append(current_log_prob.mean())
 
                         info["loss"].append(loss)
 
@@ -1011,15 +1403,30 @@ def main(_):
                         #     i + 1
                         # ) % config.train.gradient_accumulation_steps == 0
                         # log training-related stuff
-                        info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                        info = accelerator.reduce(info, reduction="mean")
-                        info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                        # Handle different types of values in info dict
+                        processed_info = {}
+                        for k, v in info.items():
+                            if k == "time_predictor_only_phase":
+                                # Boolean values - just take the first (they should all be the same)
+                                processed_info[k] = v[0] if v else False
+                            else:
+                                # Tensor values - compute mean
+                                processed_info[k] = torch.mean(torch.stack(v))
+                        
+                        processed_info = accelerator.reduce(processed_info, reduction="mean")
+                        processed_info.update({
+                            "epoch": epoch, 
+                            "inner_epoch": inner_epoch,
+                            "time_predictor_only_phase": is_time_predictor_only_phase
+                        })
                         if accelerator.is_main_process:
-                            wandb.log(info, step=global_step)
+                            wandb.log(processed_info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
                 if config.train.ema:
-                    ema.step(all_trainable_parameters, global_step)
+                    # Update EMA with current trainable parameters
+                    current_trainable = get_current_trainable_parameters()
+                    ema.step(current_trainable, global_step)
             # make sure we did an optimization step at the end of the inner epoch
             # assert accelerator.sync_gradients
         

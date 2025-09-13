@@ -350,8 +350,11 @@ class ViTTimePredictor(nn.Module):
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
                 elif isinstance(module, nn.LayerNorm):
-                    nn.init.constant_(module.weight, 1.0)
-                    nn.init.constant_(module.bias, 0)
+                    # Only initialize if the LayerNorm has learnable parameters
+                    if module.weight is not None:
+                        nn.init.constant_(module.weight, 1.0)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
         
         # Initialize head with specific alpha/beta values
         nn.init.xavier_uniform_(self.head.weight)
@@ -457,7 +460,7 @@ class HybridTimePredictor(nn.Module):
 def init_time_predictor(
     self,
     pretrained_model_name_or_path,
-    min_sigma=0.001,
+    min_sigma=0.01,
     init_alpha=1.5,
     init_beta=0.5,
     relative=True,
@@ -493,7 +496,8 @@ def init_time_predictor(
     self.epsilon = 1e-3
     self.prediction_type = prediction_type
 
-    load_time_predictor(self, pretrained_model_name_or_path)
+    if pretrained_model_name_or_path is not None:
+        load_time_predictor(self, pretrained_model_name_or_path)
 
 
 def load_time_predictor(pipeline, ckpt_path):
@@ -511,12 +515,9 @@ def load_time_predictor(pipeline, ckpt_path):
         time_predictor_state = state_dict
 
     # Load into the submodule
-    missing, unexpected = pipeline.time_predictor.load_state_dict(
-        time_predictor_state, strict=False
+    pipeline.time_predictor.load_state_dict(
+        time_predictor_state, strict=True
     )
-
-    print("Missing keys:", missing)
-    print("Unexpected keys:", unexpected)
 
 class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
     def __init__(

@@ -106,6 +106,9 @@ def pipeline_with_logprob(
     sigma = torch.ones(batch_size, dtype=latents.dtype, device=device)
     all_latents = [latents]  # Use original latents, not clone
     all_log_probs = []
+    all_time_predictor_log_probs = []  # Track time predictor logprobs
+    all_hidden_states_combineds = []  # Store hidden states for time predictor recomputation
+    all_tembs = []  # Store temporal embeddings for time predictor recomputation
     
     # Track which samples are still active (haven't reached min_sigma)
     active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -157,14 +160,21 @@ def pipeline_with_logprob(
         hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
         hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
         hidden_states_combined = torch.cat([hidden_states_1, hidden_states_2], dim=1)
+        
+        # Store hidden states and temporal embeddings for later use during training
+        # Move to CPU and convert to half precision to save memory during sampling
+        all_hidden_states_combineds.append(hidden_states_combined.half().cpu())
+        all_tembs.append(temb.half().cpu())
 
-        # Predict next sigma using time predictor
+        # Predict next sigma using time predictor and collect logprobs
         time_preds = self.time_predictor(hidden_states_combined, temb)
         sigma_next = torch.zeros_like(sigma)
+        step_time_predictor_log_probs = torch.zeros_like(sigma)
         
         for i, (param1, param2) in enumerate(time_preds):
             if not active_mask[i]:  # Skip inactive samples
                 sigma_next[i] = torch.tensor(0.0).to(sigma_next.device)
+                step_time_predictor_log_probs[i] = torch.tensor(0.0).to(sigma_next.device)
                 continue
                 
             if self.prediction_type == "alpha_beta":
@@ -181,6 +191,10 @@ def pipeline_with_logprob(
                 else ratio.clamp(self.epsilon, sigma[i]).clamp(0, 1 - self.epsilon)
             )
             sigma_next[i] = sigma[i] * ratio if self.relative else sigma[i] - ratio
+            
+            # Compute time predictor log probability for this ratio
+            time_predictor_log_prob = beta_dist.log_prob(ratio)
+            step_time_predictor_log_probs[i] = time_predictor_log_prob
             
             # Check if this sample should stop
             if sigma[i] < self.min_sigma or sigma_next[i] < self.min_sigma:
@@ -210,6 +224,7 @@ def pipeline_with_logprob(
         
         all_latents.append(latents)
         all_log_probs.append(log_prob)
+        all_time_predictor_log_probs.append(step_time_predictor_log_probs)
 
         # Check if we should stop (all samples inactive)
         if not active_mask.any():
@@ -245,4 +260,8 @@ def pipeline_with_logprob(
             self.text_encoder_3.to('cpu')
 
 
-    return image, all_latents, all_log_probs, timesteps_per_sample, all_sigmas_per_step
+    # Stack hidden states and temporal embeddings to match timesteps structure
+    all_hidden_states_combineds = torch.stack(all_hidden_states_combineds, dim=1)  # (batch_size, num_steps, ...)
+    all_tembs = torch.stack(all_tembs, dim=1)  # (batch_size, num_steps, ...)
+
+    return image, all_latents, all_log_probs, all_time_predictor_log_probs, timesteps_per_sample, all_sigmas_per_step, all_hidden_states_combineds, all_tembs

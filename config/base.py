@@ -95,6 +95,14 @@ def get_config():
     train.lora_path = None
     # save ema model
     train.ema = False
+    # number of epochs to train only the time_predictor (keep rest of model frozen)
+    # This is useful for warm-starting the time_predictor before joint training.
+    # During these epochs, only time_predictor parameters are updated while transformer stays frozen.
+    # After this phase, normal training resumes with both components trainable.
+    # set to 0 to disable time_predictor-only training
+    # Note: You can use the same optimizer for both phases - PyTorch will automatically
+    # skip gradients for frozen parameters. No need for separate optimizers.
+    train.time_predictor_only_epochs = 0
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.
