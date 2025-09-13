@@ -6,6 +6,8 @@ from concurrent import futures
 import time
 import json
 import hashlib
+import gc
+import psutil
 from absl import app, flags
 from accelerate import Accelerator
 from ml_collections import config_flags
@@ -36,6 +38,12 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
+
+def cleanup_memory():
+    """Force memory cleanup"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 FLAGS = flags.FLAGS
@@ -266,8 +274,20 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
     next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
     
     # Use stored hidden states and temporal embeddings from the sampling phase
-    hidden_states_combined = sample["hidden_states_combineds"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
-    temb = sample["tembs"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    # Move to device only once and reuse
+    hidden_states_combined = sample["hidden_states_combineds"][:, j]
+    temb = sample["tembs"][:, j]
+    
+    # Move to GPU only if not already there, and convert dtype efficiently
+    if hidden_states_combined.device != device:
+        hidden_states_combined = hidden_states_combined.to(device, dtype=torch.float32, non_blocking=True)
+    else:
+        hidden_states_combined = hidden_states_combined.to(dtype=torch.float32)
+        
+    if temb.device != device:
+        temb = temb.to(device, dtype=torch.float32, non_blocking=True)
+    else:
+        temb = temb.to(dtype=torch.float32)
     
     # Call the time predictor to get alpha and beta
     time_preds = pipeline.time_predictor(hidden_states_combined, temb)
@@ -334,8 +354,20 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
     current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
     
     # Use stored hidden states and temporal embeddings from the sampling phase
-    hidden_states_combined = sample["hidden_states_combineds"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
-    temb = sample["tembs"][:, j].to(device, dtype=torch.float32)  # Move from CPU to GPU and convert to float32
+    # Optimize tensor transfers similar to compute_time_predictor_log_prob
+    hidden_states_combined = sample["hidden_states_combineds"][:, j]
+    temb = sample["tembs"][:, j]
+    
+    # Move to GPU only if not already there, and convert dtype efficiently
+    if hidden_states_combined.device != device:
+        hidden_states_combined = hidden_states_combined.to(device, dtype=torch.float32, non_blocking=True)
+    else:
+        hidden_states_combined = hidden_states_combined.to(dtype=torch.float32)
+        
+    if temb.device != device:
+        temb = temb.to(device, dtype=torch.float32, non_blocking=True)
+    else:
+        temb = temb.to(dtype=torch.float32)
     
     # Call the time predictor to get alpha and beta
     time_preds = pipeline.time_predictor(hidden_states_combined, temb)
@@ -994,9 +1026,7 @@ def main(_):
             # all_sigmas_per_step contains sigma values for each step, we need to stack them
             sigmas = torch.stack(all_sigmas_per_step, dim=1)  # (batch_size, num_steps + 1)
 
-            # timesteps = pipeline.scheduler.timesteps.repeat(
-            #     config.sample.train_batch_size, 1
-            # )  # (batch_size, num_steps)
+            # Stack timesteps - this should work if scheduler.timesteps has consistent shapes
             timesteps = torch.stack(pipeline.scheduler.timesteps, dim=1)
 
             # compute rewards asynchronously
@@ -1022,7 +1052,7 @@ def main(_):
                     "hidden_states_combineds": hidden_states_combineds,
                     "tembs": tembs,
                     "rewards": rewards,
-                    "sigmas": sigmas,  # sigma values for each timestep
+                    "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
                 }
             )
 
@@ -1039,46 +1069,87 @@ def main(_):
                 key: torch.as_tensor(value, device=accelerator.device).float()
                 for key, value in rewards.items()
             }
+            # Keep rewards for WandB logging - will be cleaned up later
+        
+        # Force garbage collection after reward computation
+        gc.collect()
 
         # Pad tensors to the same length before collation to handle variable timesteps
-        max_timesteps = max(s["latents"].shape[1] for s in samples)
+        # Note: sigmas has shape (batch_size, num_steps + 1) while others have (batch_size, num_steps)
+        max_timesteps = max(s["latents"].shape[1] for s in samples)  # This is num_steps
+        max_timesteps_sigmas = max_timesteps + 1  # For sigmas which need num_steps + 1
         
         for sample in samples:
             current_timesteps = sample["latents"].shape[1]
             if current_timesteps < max_timesteps:
                 pad_size = max_timesteps - current_timesteps
-                # Pad latents, next_latents, log_probs, timesteps, and sigmas
+                
+                # Use more memory-efficient padding by pre-allocating full-size tensors
+                # and copying data instead of concatenating
                 for key in ["latents", "next_latents"]:
                     if key in sample:
-                        # Pad with zeros for latents
-                        pad_shape = [sample[key].shape[0], pad_size] + list(sample[key].shape[2:])
-                        pad_tensor = torch.zeros(pad_shape, device=sample[key].device, dtype=sample[key].dtype)
-                        sample[key] = torch.cat([sample[key], pad_tensor], dim=1)
+                        original_tensor = sample[key]
+                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                        # Create new tensor with full size
+                        full_shape = [original_tensor.shape[0], max_timesteps] + list(original_tensor.shape[2:])
+                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
+                        # Copy original data using actual tensor dimensions
+                        new_tensor[:, :actual_timesteps] = original_tensor
+                        sample[key] = new_tensor
+                        del original_tensor  # Explicit cleanup
                 
-                # Pad log_probs and time_predictor_log_probs with zeros
+                # Same for log_probs and time_predictor_log_probs
                 for logprob_key in ["log_probs", "time_predictor_log_probs"]:
                     if logprob_key in sample:
-                        pad_shape = [sample[logprob_key].shape[0], pad_size]
-                        pad_tensor = torch.zeros(pad_shape, device=sample[logprob_key].device, dtype=sample[logprob_key].dtype)
-                        sample[logprob_key] = torch.cat([sample[logprob_key], pad_tensor], dim=1)
+                        original_tensor = sample[logprob_key]
+                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                        full_shape = [original_tensor.shape[0], max_timesteps]
+                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
+                        new_tensor[:, :actual_timesteps] = original_tensor
+                        sample[logprob_key] = new_tensor
+                        del original_tensor  # Explicit cleanup
                 
-                # Pad hidden_states_combineds and tembs 
+                # More memory-efficient padding for hidden_states_combineds and tembs 
                 for tensor_key in ["hidden_states_combineds", "tembs"]:
                     if tensor_key in sample:
-                        # Pad with zeros, matching the shape of existing tensors
-                        pad_shape = [sample[tensor_key].shape[0], pad_size] + list(sample[tensor_key].shape[2:])
-                        pad_tensor = torch.zeros(pad_shape, device=sample[tensor_key].device, dtype=sample[tensor_key].dtype)
-                        sample[tensor_key] = torch.cat([sample[tensor_key], pad_tensor], dim=1)
+                        original_tensor = sample[tensor_key]
+                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                        full_shape = [original_tensor.shape[0], max_timesteps] + list(original_tensor.shape[2:])
+                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
+                        new_tensor[:, :actual_timesteps] = original_tensor
+                        sample[tensor_key] = new_tensor
+                        del original_tensor  # Explicit cleanup
                 
                 # Pad timesteps - use the last timestep value for padding
                 if "timesteps" in sample:
-                    last_timestep = sample["timesteps"][:, -1:].repeat(1, pad_size)
-                    sample["timesteps"] = torch.cat([sample["timesteps"], last_timestep], dim=1)
+                    original_tensor = sample["timesteps"]
+                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps], 
+                                           device=original_tensor.device, dtype=original_tensor.dtype)
+                    new_tensor[:, :actual_timesteps] = original_tensor
+                    # Fill padding with last timestep value
+                    if actual_timesteps > 0:
+                        last_timestep = original_tensor[:, -1:]
+                        pad_size_actual = max_timesteps - actual_timesteps
+                        new_tensor[:, actual_timesteps:] = last_timestep.repeat(1, pad_size_actual)
+                    sample["timesteps"] = new_tensor
+                    del original_tensor  # Explicit cleanup
                 
-                # Pad sigmas - use the last sigma value for padding  
+                # Pad sigmas - special case since it has num_steps + 1 elements
                 if "sigmas" in sample:
-                    last_sigma = sample["sigmas"][:, -1:].repeat(1, pad_size)
-                    sample["sigmas"] = torch.cat([sample["sigmas"], last_sigma], dim=1)
+                    original_tensor = sample["sigmas"]
+                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_sigmas], 
+                                           device=original_tensor.device, dtype=original_tensor.dtype)
+                    new_tensor[:, :actual_timesteps] = original_tensor
+                    # Fill padding with last sigma value
+                    if actual_timesteps > 0:
+                        last_sigma = original_tensor[:, -1:]
+                        pad_size_actual = max_timesteps_sigmas - actual_timesteps
+                        new_tensor[:, actual_timesteps:] = last_sigma.repeat(1, pad_size_actual)
+                    sample["sigmas"] = new_tensor
+                    del original_tensor  # Explicit cleanup
+
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
@@ -1120,6 +1191,10 @@ def main(_):
                     },
                     step=global_step,
                 )
+        
+        # Clean up rewards after WandB logging
+        del rewards, reward_metadata
+        
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # Get actual number of timesteps from the samples data
         actual_num_timesteps = samples["latents"].shape[1]
@@ -1443,6 +1518,9 @@ def main(_):
             # assert accelerator.sync_gradients
         
         epoch+=1
+        
+        # Memory cleanup at end of epoch
+        cleanup_memory()
         
 if __name__ == "__main__":
     app.run(main)
