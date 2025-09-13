@@ -286,28 +286,35 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
             alpha = param1 * (param2 - 2) + 1
             beta = (1 - param1) * (param2 - 2) + 1
         
+        # Validate alpha and beta parameters before creating Beta distribution
+        alpha = torch.clamp(alpha, min=1e-6)
+        beta = torch.clamp(beta, min=1e-6)
+        
+        # Check for any invalid values in parameters
+        if torch.isnan(alpha) or torch.isinf(alpha) or torch.isnan(beta) or torch.isinf(beta):
+            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            continue
+        
+        # Validate sigma values before ratio calculation
+        if torch.isnan(current_sigmas[i]) or torch.isinf(current_sigmas[i]) or \
+           torch.isnan(next_sigmas[i]) or torch.isinf(next_sigmas[i]) or \
+           current_sigmas[i] <= 0:
+            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            continue
+        
         beta_dist = torch.distributions.Beta(alpha, beta)
         
         # Calculate the ratio from the stored sigmas
         if pipeline.relative:
-            # Check for division by zero or invalid values
-            if current_sigmas[i] == 0 or torch.isnan(current_sigmas[i]) or torch.isnan(next_sigmas[i]):
-                time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
-                continue
             ratio = next_sigmas[i] / current_sigmas[i]
         else:
-            # Check for invalid values in non-relative case
-            if torch.isnan(current_sigmas[i]) or torch.isnan(next_sigmas[i]):
-                time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
-                continue
             ratio = current_sigmas[i] - next_sigmas[i]
         
-        # Check if ratio is NaN or inf before clamping
+        # Clamp ratio and check for NaN/inf
+        ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
         if torch.isnan(ratio) or torch.isinf(ratio):
             time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
             continue
-            
-        ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
         
         # Compute the log probability
         time_predictor_log_prob = beta_dist.log_prob(ratio)
@@ -346,6 +353,11 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
         elif pipeline.prediction_type == "mode_concentration":
             alpha = param1 * (param2 - 2) + 1
             beta = (1 - param1) * (param2 - 2) + 1
+        
+        # Validate sigma values before using them for reference distribution
+        if torch.isnan(current_sigmas[i]) or torch.isinf(current_sigmas[i]) or current_sigmas[i] <= 0:
+            kl_divergences[i] = torch.tensor(0.0, device=device)
+            continue
         
         # Get reference distribution parameters using the same logic as in modeling_sd3_pnt.py
         if pipeline.relative:
