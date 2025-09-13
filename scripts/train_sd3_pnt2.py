@@ -1225,10 +1225,33 @@ def main(_):
         gc.collect()
         
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
-        # Get actual number of timesteps from the samples data
-        actual_num_timesteps = samples["latents"].shape[1]
-        # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
-        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, actual_num_timesteps)
+        # Get maximum padded timesteps and actual timesteps per sample
+        max_padded_timesteps = samples["latents"].shape[1]
+        timesteps_per_sample = samples["timesteps_per_sample"]  # Actual timesteps for each sample
+        
+        # Apply gamma discounting like in modeling_sd3_pnt.py reward function
+        # Only apply during time predictor only training phase
+        gamma = config.reward_gamma
+        if is_time_predictor_only_phase and gamma < 1.0:  # Only apply gamma discounting during time predictor only training
+            # Create gamma-discounted rewards for each timestep using actual timesteps per sample
+            batch_size = samples["rewards"]["avg"].shape[0]
+            discounted_rewards = torch.zeros(batch_size, max_padded_timesteps, device=samples["rewards"]["avg"].device)
+            
+            for i in range(batch_size):
+                final_reward = samples["rewards"]["avg"][i].item()
+                actual_timesteps = timesteps_per_sample[i].item()  # Use actual timesteps for this sample
+                
+                # Apply gamma discounting: reward_t = final_reward * gamma^(last_timestep - t)
+                for t in range(actual_timesteps):
+                    discounted_rewards[i, t] = final_reward * (gamma ** (actual_timesteps - 1 - t))
+                # Normalize by the actual number of timesteps (like in modeling_sd3_pnt.py)
+                discounted_rewards[i, :actual_timesteps] = discounted_rewards[i, :actual_timesteps] / actual_timesteps
+                # Padded timesteps remain 0
+            
+            samples["rewards"]["avg"] = discounted_rewards
+        else:
+            # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
+            samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, max_padded_timesteps)
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}

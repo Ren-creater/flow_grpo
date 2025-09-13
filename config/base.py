@@ -113,6 +113,12 @@ def get_config():
     ###### Reward Function ######
     # reward function to use. see `rewards.py` for available reward functions.
     config.reward_fn = ml_collections.ConfigDict()
+    # gamma discount factor for temporal reward weighting (like in modeling_sd3_pnt.py)
+    # Only applied during time_predictor_only training phase
+    # When < 1.0, earlier timesteps get lower rewards: reward_t = final_reward * gamma^(last_timestep - t)
+    # When = 1.0, all timesteps get the same reward (original behavior)
+    # During joint training, gamma discounting is disabled and uniform rewards are used
+    config.reward_gamma = 0.9
     config.save_dir = ''
 
     ###### Per-Prompt Stat Tracking ######
