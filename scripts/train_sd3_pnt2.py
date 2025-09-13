@@ -1095,7 +1095,8 @@ def main(_):
             }
             # Keep rewards for WandB logging - will be cleaned up later
         
-        # Force garbage collection after reward computation
+        # Clean up large tensors immediately
+        del latents, log_probs, time_predictor_log_probs, sigmas, timesteps
         gc.collect()
 
         # Pad tensors to the same length before collation to handle variable timesteps
