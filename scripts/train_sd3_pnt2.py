@@ -292,12 +292,15 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
     # Call the time predictor to get alpha and beta
     time_preds = pipeline.time_predictor(hidden_states_combined, temb)
     
-    time_predictor_log_probs = torch.zeros(current_batch_size, device=device)
+    # Build list of log probabilities and construct final tensor from gradient-enabled tensors
+    log_probs_list = []
     
     for i, (param1, param2) in enumerate(time_preds):
         # Skip log prob computation if sigma is below threshold (following modeling_sd3_pnt.py pattern)
         if current_sigmas[i] < pipeline.min_sigma:
-            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
+            log_probs_list.append(zero_logprob)
             continue
             
         if pipeline.prediction_type == "alpha_beta":
@@ -312,14 +315,18 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         
         # Check for any invalid values in parameters
         if torch.isnan(alpha) or torch.isinf(alpha) or torch.isnan(beta) or torch.isinf(beta):
-            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
+            log_probs_list.append(zero_logprob)
             continue
         
         # Validate sigma values before ratio calculation
         if torch.isnan(current_sigmas[i]) or torch.isinf(current_sigmas[i]) or \
            torch.isnan(next_sigmas[i]) or torch.isinf(next_sigmas[i]) or \
            current_sigmas[i] <= 0:
-            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
+            log_probs_list.append(zero_logprob)
             continue
         
         beta_dist = torch.distributions.Beta(alpha, beta)
@@ -333,12 +340,17 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         # Clamp ratio and check for NaN/inf
         ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
         if torch.isnan(ratio) or torch.isinf(ratio):
-            time_predictor_log_probs[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
+            log_probs_list.append(zero_logprob)
             continue
         
         # Compute the log probability
         time_predictor_log_prob = beta_dist.log_prob(ratio)
-        time_predictor_log_probs[i] = time_predictor_log_prob
+        log_probs_list.append(time_predictor_log_prob)
+    
+    # Stack all log probabilities into a single tensor that maintains gradients
+    time_predictor_log_probs = torch.stack(log_probs_list, dim=0)
     
     return time_predictor_log_probs
 
@@ -372,12 +384,15 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
     # Call the time predictor to get alpha and beta
     time_preds = pipeline.time_predictor(hidden_states_combined, temb)
     
-    kl_divergences = torch.zeros(current_batch_size, device=device)
+    # Build list of KL divergences and construct final tensor from gradient-enabled tensors
+    kl_divs_list = []
     
     for i, (param1, param2) in enumerate(time_preds):
         # Skip KL computation if sigma is below threshold (following modeling_sd3_pnt.py pattern)
         if current_sigmas[i] < pipeline.min_sigma:
-            kl_divergences[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_kl = param1 * 0.0  # This maintains gradients from the time predictor
+            kl_divs_list.append(zero_kl)
             continue
             
         if pipeline.prediction_type == "alpha_beta":
@@ -388,7 +403,9 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
         
         # Validate sigma values before using them for reference distribution
         if torch.isnan(current_sigmas[i]) or torch.isinf(current_sigmas[i]) or current_sigmas[i] <= 0:
-            kl_divergences[i] = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_kl = param1 * 0.0  # This maintains gradients from the time predictor
+            kl_divs_list.append(zero_kl)
             continue
         
         # Get reference distribution parameters using the same logic as in modeling_sd3_pnt.py
@@ -411,7 +428,9 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
         # Check for any invalid values (NaN, inf)
         if torch.isnan(alpha) or torch.isinf(alpha) or torch.isnan(beta) or torch.isinf(beta) or \
            torch.isnan(ref_alpha) or torch.isinf(ref_alpha) or torch.isnan(ref_beta) or torch.isinf(ref_beta):
-            kl_div = torch.tensor(0.0, device=device)
+            # Use a zero tensor that maintains gradients from time_preds
+            zero_kl = param1 * 0.0  # This maintains gradients from the time predictor
+            kl_divs_list.append(zero_kl)
         else:
             # Create distributions and compute KL divergence
             predicted_dist = torch.distributions.Beta(alpha, beta)
@@ -419,9 +438,14 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
             kl_div = torch.distributions.kl_divergence(predicted_dist, ref_dist)
             # Final check for NaN/inf in the result
             if torch.isnan(kl_div) or torch.isinf(kl_div):
-                kl_div = torch.tensor(0.0, device=device)
-        
-        kl_divergences[i] = kl_div
+                # Use a zero tensor that maintains gradients from time_preds
+                zero_kl = param1 * 0.0  # This maintains gradients from the time predictor
+                kl_divs_list.append(zero_kl)
+            else:
+                kl_divs_list.append(kl_div)
+    
+    # Stack all KL divergences into a single tensor that maintains gradients
+    kl_divergences = torch.stack(kl_divs_list, dim=0)
     
     return kl_divergences
 
@@ -1150,6 +1174,8 @@ def main(_):
                     sample["sigmas"] = new_tensor
                     del original_tensor  # Explicit cleanup
 
+        # Force garbage collection before collation
+        gc.collect()
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
@@ -1192,8 +1218,10 @@ def main(_):
                     step=global_step,
                 )
         
-        # Clean up rewards after WandB logging
+        # Clean up rewards and images after WandB logging
         del rewards, reward_metadata
+        del images  # Free large image tensor
+        gc.collect()
         
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # Get actual number of timesteps from the samples data
@@ -1255,6 +1283,9 @@ def main(_):
 
         del samples["rewards"]
         del samples["prompt_ids"]
+        
+        # Additional cleanup to prevent memory leaks
+        gc.collect()
 
         # Get the mask for samples where all advantages are zero across the time dimension
         mask = (samples["advantages"].abs().sum(dim=1) != 0)
@@ -1478,8 +1509,9 @@ def main(_):
                         # backward pass
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
+                            current_trainable = get_current_trainable_parameters()
                             accelerator.clip_grad_norm_(
-                                transformer.parameters(), config.train.max_grad_norm
+                                current_trainable, config.train.max_grad_norm
                             )
                         optimizer.step()
                         optimizer.zero_grad()
