@@ -1185,82 +1185,83 @@ def main(_):
         gc.collect()
 
         # Pad tensors to the same length before collation to handle variable timesteps
-        # Note: sigmas has shape (batch_size, num_steps + 1) while others have (batch_size, num_steps)
-        max_timesteps = max(s["latents"].shape[1] for s in samples)  # This is num_steps
-        max_timesteps_sigmas = max_timesteps + 1  # For sigmas which need num_steps + 1
+        # Note: latents now has shape (batch_size, num_steps + 1) 
+        # while log_probs have (batch_size, num_steps)
+        # sigmas has shape (batch_size, num_steps + 1) like latents
+        max_timesteps_latents = max(s["latents"].shape[1] for s in samples)  # This is num_steps + 1
+        max_timesteps_logprobs = max_timesteps_latents - 1  # This is num_steps for log_probs
         
         for sample in samples:
-            current_timesteps = sample["latents"].shape[1]
-            if current_timesteps < max_timesteps:
-                pad_size = max_timesteps - current_timesteps
+            current_timesteps_latents = sample["latents"].shape[1]
+            if current_timesteps_latents < max_timesteps_latents:
                 
                 # Use more memory-efficient padding by pre-allocating full-size tensors
                 # and copying data instead of concatenating
-                # Handle latents separately since it has num_steps + 1 timesteps
+                # Handle latents - it already has num_steps + 1 timesteps
                 if "latents" in sample:
                     original_tensor = sample["latents"]
                     actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    # For latents, we need max_timesteps + 1 to maintain the +1 offset
-                    full_shape = [original_tensor.shape[0], max_timesteps + 1] + list(original_tensor.shape[2:])
+                    # For latents, pad to max_timesteps_latents
+                    full_shape = [original_tensor.shape[0], max_timesteps_latents] + list(original_tensor.shape[2:])
                     new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
                     # Copy original data using actual tensor dimensions
                     new_tensor[:, :actual_timesteps] = original_tensor
                     # Fill padding with last latent value
                     if actual_timesteps > 0:
                         last_latent = original_tensor[:, -1:]
-                        pad_size_actual = (max_timesteps + 1) - actual_timesteps
+                        pad_size_actual = max_timesteps_latents - actual_timesteps
                         new_tensor[:, actual_timesteps:] = last_latent.repeat(1, pad_size_actual, 1, 1, 1)
                     sample["latents"] = new_tensor
                     del original_tensor  # Explicit cleanup
                 
-                # Same for log_probs and time_predictor_log_probs
+                # Same for log_probs and time_predictor_log_probs (they have num_steps)
                 for logprob_key in ["log_probs", "time_predictor_log_probs"]:
                     if logprob_key in sample:
                         original_tensor = sample[logprob_key]
                         actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                        full_shape = [original_tensor.shape[0], max_timesteps]
+                        full_shape = [original_tensor.shape[0], max_timesteps_logprobs]
                         new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
                         new_tensor[:, :actual_timesteps] = original_tensor
                         sample[logprob_key] = new_tensor
                         del original_tensor  # Explicit cleanup
                 
-                # More memory-efficient padding for hidden_states_combineds and tembs 
+                # More memory-efficient padding for hidden_states_combineds and tembs (they have num_steps)
                 for tensor_key in ["hidden_states_combineds", "tembs"]:
                     if tensor_key in sample:
                         original_tensor = sample[tensor_key]
                         actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                        full_shape = [original_tensor.shape[0], max_timesteps] + list(original_tensor.shape[2:])
+                        full_shape = [original_tensor.shape[0], max_timesteps_logprobs] + list(original_tensor.shape[2:])
                         new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
                         new_tensor[:, :actual_timesteps] = original_tensor
                         sample[tensor_key] = new_tensor
                         del original_tensor  # Explicit cleanup
                 
-                # Pad timesteps - use the last timestep value for padding
+                # Pad timesteps - use the last timestep value for padding (they have num_steps)
                 if "timesteps" in sample:
                     original_tensor = sample["timesteps"]
                     actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps], 
+                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_logprobs], 
                                            device=original_tensor.device, dtype=original_tensor.dtype)
                     new_tensor[:, :actual_timesteps] = original_tensor
                     # Fill padding with last timestep value
                     if actual_timesteps > 0:
                         last_timestep = original_tensor[:, -1:]
-                        pad_size_actual = max_timesteps - actual_timesteps
+                        pad_size_actual = max_timesteps_logprobs - actual_timesteps
                         new_tensor[:, actual_timesteps:] = last_timestep.repeat(1, pad_size_actual)
                     sample["timesteps"] = new_tensor
                     del original_tensor  # Explicit cleanup
                 
-                # Pad sigmas - special case since it has num_steps + 1 elements
+                # Pad sigmas - they have num_steps + 1 elements like latents
                 if "sigmas" in sample:
                     original_tensor = sample["sigmas"]
                     actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_sigmas], 
+                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_latents], 
                                            device=original_tensor.device, dtype=original_tensor.dtype)
                     new_tensor[:, :actual_timesteps] = original_tensor
                     # Fill padding with last sigma value
                     if actual_timesteps > 0:
                         last_sigma = original_tensor[:, -1:]
-                        pad_size_actual = max_timesteps_sigmas - actual_timesteps
+                        pad_size_actual = max_timesteps_latents - actual_timesteps
                         new_tensor[:, actual_timesteps:] = last_sigma.repeat(1, pad_size_actual)
                     sample["sigmas"] = new_tensor
                     del original_tensor  # Explicit cleanup
@@ -1316,7 +1317,8 @@ def main(_):
         
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # Get maximum padded timesteps and actual timesteps per sample
-        max_padded_timesteps = samples["latents"].shape[1]
+        # latents has shape (batch_size, num_steps + 1), but rewards need to match timesteps (num_steps)
+        max_padded_timesteps_rewards = samples["latents"].shape[1] - 1  # Subtract 1 for rewards
         timesteps_per_sample = samples["timesteps_per_sample"]  # Actual timesteps for each sample
         
         # Apply gamma discounting like in modeling_sd3_pnt.py reward function
@@ -1325,7 +1327,7 @@ def main(_):
         if is_time_predictor_only_phase and gamma < 1.0:  # Only apply gamma discounting during time predictor only training
             # Create gamma-discounted rewards for each timestep using actual timesteps per sample
             batch_size = samples["rewards"]["avg"].shape[0]
-            discounted_rewards = torch.zeros(batch_size, max_padded_timesteps, device=samples["rewards"]["avg"].device)
+            discounted_rewards = torch.zeros(batch_size, max_padded_timesteps_rewards, device=samples["rewards"]["avg"].device)
             
             for i in range(batch_size):
                 final_reward = samples["rewards"]["avg"][i].item()
@@ -1341,7 +1343,7 @@ def main(_):
             samples["rewards"]["avg"] = discounted_rewards
         else:
             # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
-            samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, max_padded_timesteps)
+            samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, max_padded_timesteps_rewards)
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
@@ -1493,7 +1495,8 @@ def main(_):
                     pooled_embeds = sample["pooled_prompt_embeds"]
 
                 # Get actual number of timesteps from the sample data
-                actual_num_timesteps = sample["latents"].shape[1]  # Maximum timesteps across batch
+                # latents has shape (batch_size, num_steps + 1), but training runs for num_steps
+                actual_num_timesteps = sample["latents"].shape[1] - 1  # Subtract 1 since latents has num_steps + 1
                 timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
                 train_timesteps = [step_index for step_index in range(actual_num_timesteps)]
                 
