@@ -252,9 +252,9 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
         pipeline.scheduler,
         noise_pred.float(),
-        sample["timesteps"][:, j],
-        sample["latents"][:, j].float(),
-        prev_sample=sample["next_latents"][:, j].float(),
+        current_timesteps,
+        current_latents,
+        prev_sample=next_latents,
         noise_level=config.sample.noise_level,
     )
 

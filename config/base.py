@@ -18,7 +18,8 @@ def get_config():
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
-    config.mixed_precision = "fp16"
+    #config.mixed_precision = "fp16"
+    config.mixed_precision = "bf16"
     # allow tf32 on Ampere GPUs, which can speed up training.
     config.allow_tf32 = True
     # whether or not to use LoRA.
