@@ -1503,12 +1503,16 @@ def main(_):
                     leave=False,
                     disable=not accelerator.is_local_main_process,
                 ):
+                    # Create mask for active samples at this timestep
+                    timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
+                    active_mask = (j < timesteps_per_sample).bool()  # Shape: (batch_size,)
+                    
+                    # Skip timesteps where no samples are active (all have reached their endpoint)
+                    if not active_mask.any():
+                        continue
+                    
                     with accelerator.accumulate(transformer):
                         with autocast():
-                            
-                            # Create mask for active samples at this timestep
-                            timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
-                            active_mask = (j < timesteps_per_sample).bool()  # Shape: (batch_size,)
                             
                             if not is_time_predictor_only_phase:
                                 # Full joint training: compute both diffusion and time predictor logprobs
