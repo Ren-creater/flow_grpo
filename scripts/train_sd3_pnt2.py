@@ -190,7 +190,7 @@ def create_generator(prompts, base_seed):
     return generators
 
         
-def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
+def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask=None):
     # Set up scheduler state for sde_step_with_logprob
     current_batch_size = sample["latents"].shape[0]
     current_timesteps = sample["timesteps"][:, j]  # timesteps for step j across current batch
@@ -225,6 +225,16 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
         sigma_max = torch.ones_like(current_sigmas)
     pipeline.scheduler.sigmas[1] = sigma_max
     
+    # Debug: Check transformer inputs for NaN/Inf
+    if torch.isnan(sample["latents"][:, j]).any() or torch.isinf(sample["latents"][:, j]).any():
+        logger.warning(f"NaN/Inf detected in transformer input latents at timestep {j}: {sample['latents'][:, j].isnan().sum()} NaNs, {sample['latents'][:, j].isinf().sum()} Infs")
+    if torch.isnan(sample["timesteps"][:, j]).any() or torch.isinf(sample["timesteps"][:, j]).any():
+        logger.warning(f"NaN/Inf detected in transformer input timesteps at timestep {j}: {sample['timesteps'][:, j]}")
+    if torch.isnan(embeds).any() or torch.isinf(embeds).any():
+        logger.warning(f"NaN/Inf detected in transformer input embeds at timestep {j}: {embeds.isnan().sum()} NaNs, {embeds.isinf().sum()} Infs")
+    if torch.isnan(pooled_embeds).any() or torch.isinf(pooled_embeds).any():
+        logger.warning(f"NaN/Inf detected in transformer input pooled_embeds at timestep {j}: {pooled_embeds.isnan().sum()} NaNs, {pooled_embeds.isinf().sum()} Infs")
+    
     if config.train.cfg:
         noise_pred = transformer(
             hidden_states=torch.cat([sample["latents"][:, j]] * 2),
@@ -248,15 +258,52 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
             return_dict=False,
         )[0]
     
+    # Debug: Check noise prediction for NaN/Inf
+    if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
+        logger.warning(f"NaN/Inf detected in noise_pred at timestep {j}: {noise_pred.isnan().sum()} NaNs, {noise_pred.isinf().sum()} Infs")
+        logger.warning(f"noise_pred stats: min={noise_pred.min()}, max={noise_pred.max()}, mean={noise_pred.mean()}")
+    
+    # Debug: Check inputs to sde_step_with_logprob
+    current_timesteps = sample["timesteps"][:, j]
+    current_latents = sample["latents"][:, j].float()
+    next_latents = sample["next_latents"][:, j].float()
+    
+    if torch.isnan(current_timesteps).any() or torch.isinf(current_timesteps).any():
+        logger.warning(f"NaN/Inf detected in current_timesteps at timestep {j}: {current_timesteps}")
+    if torch.isnan(current_latents).any() or torch.isinf(current_latents).any():
+        logger.warning(f"NaN/Inf detected in current_latents at timestep {j}: {current_latents.isnan().sum()} NaNs, {current_latents.isinf().sum()} Infs")
+    if torch.isnan(next_latents).any() or torch.isinf(next_latents).any():
+        logger.warning(f"NaN/Inf detected in next_latents at timestep {j}: {next_latents.isnan().sum()} NaNs, {next_latents.isinf().sum()} Infs")
+    
     # compute the log prob of next_latents given latents under the current model
     prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
         pipeline.scheduler,
         noise_pred.float(),
-        sample["timesteps"][:, j],
-        sample["latents"][:, j].float(),
-        prev_sample=sample["next_latents"][:, j].float(),
+        current_timesteps,
+        current_latents,
+        prev_sample=next_latents,
         noise_level=config.sample.noise_level,
+        active_mask=active_mask,  # Pass active_mask to handle inactive samples
     )
+    
+    # Debug: Check outputs from sde_step_with_logprob for NaN/Inf
+    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
+        logger.warning(f"NaN/Inf detected in diffusion log_prob at timestep {j}: {log_prob}")
+        logger.warning(f"diffusion log_prob stats: min={log_prob.min()}, max={log_prob.max()}, mean={log_prob.mean()}")
+        # Temporary fix: replace NaN values with a default value to prevent training crash
+        log_prob = torch.where(torch.isnan(log_prob) | torch.isinf(log_prob), 
+                              torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype), 
+                              log_prob)
+        logger.warning(f"Replaced NaN/Inf in diffusion log_prob with zeros")
+    if prev_sample_mean is not None and (torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any()):
+        logger.warning(f"NaN/Inf detected in prev_sample_mean at timestep {j}: {prev_sample_mean.isnan().sum()} NaNs, {prev_sample_mean.isinf().sum()} Infs")
+        # Temporary fix: replace NaN values to prevent training crash
+        prev_sample_mean = torch.where(torch.isnan(prev_sample_mean) | torch.isinf(prev_sample_mean),
+                                     torch.tensor(0.0, device=prev_sample_mean.device, dtype=prev_sample_mean.dtype),
+                                     prev_sample_mean)
+        logger.warning(f"Replaced NaN/Inf in prev_sample_mean with zeros")
+    if std_dev_t is not None and (torch.isnan(std_dev_t).any() or torch.isinf(std_dev_t).any()):
+        logger.warning(f"NaN/Inf detected in std_dev_t at timestep {j}: {std_dev_t}")
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
@@ -272,6 +319,12 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
     # Get current and next sigmas for this timestep
     current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
     next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
+    
+    # Debug: Check sigma inputs for NaN/Inf
+    if torch.isnan(current_sigmas).any() or torch.isinf(current_sigmas).any():
+        logger.warning(f"NaN/Inf detected in current_sigmas at timestep {j}: {current_sigmas}")
+    if torch.isnan(next_sigmas).any() or torch.isinf(next_sigmas).any():
+        logger.warning(f"NaN/Inf detected in next_sigmas at timestep {j}: {next_sigmas}")
     
     # Use stored hidden states and temporal embeddings from the sampling phase
     # Move to device only once and reuse
@@ -289,8 +342,21 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
     else:
         temb = temb.to(dtype=torch.float32)
     
+    # Debug: Check inputs to time predictor for NaN/Inf
+    if torch.isnan(hidden_states_combined).any() or torch.isinf(hidden_states_combined).any():
+        logger.warning(f"NaN/Inf detected in hidden_states_combined at timestep {j}: {hidden_states_combined.isnan().sum()} NaNs, {hidden_states_combined.isinf().sum()} Infs")
+    if torch.isnan(temb).any() or torch.isinf(temb).any():
+        logger.warning(f"NaN/Inf detected in temb at timestep {j}: {temb.isnan().sum()} NaNs, {temb.isinf().sum()} Infs")
+    
     # Call the time predictor to get alpha and beta
     time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+    
+    # Check time_preds for NaN before processing
+    for i, (param1, param2) in enumerate(time_preds):
+        if torch.isnan(param1).any() or torch.isinf(param1).any():
+            logger.warning(f"NaN/Inf detected in time_predictor param1 for sample {i}: {param1}")
+        if torch.isnan(param2).any() or torch.isinf(param2).any():
+            logger.warning(f"NaN/Inf detected in time_predictor param2 for sample {i}: {param2}")
     
     # Build list of log probabilities and construct final tensor from gradient-enabled tensors
     log_probs_list = []
@@ -308,6 +374,12 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         elif pipeline.prediction_type == "mode_concentration":
             alpha = param1 * (param2 - 2) + 1
             beta = (1 - param1) * (param2 - 2) + 1
+        
+        # Debug: Check alpha and beta calculation
+        if torch.isnan(alpha) or torch.isinf(alpha):
+            logger.warning(f"NaN/Inf in alpha for sample {i}: alpha={alpha}, param1={param1}, param2={param2}")
+        if torch.isnan(beta) or torch.isinf(beta):
+            logger.warning(f"NaN/Inf in beta for sample {i}: beta={beta}, param1={param1}, param2={param2}")
         
         # Validate alpha and beta parameters before creating Beta distribution
         alpha = torch.clamp(alpha, min=1e-6)
@@ -337,9 +409,18 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         else:
             ratio = current_sigmas[i] - next_sigmas[i]
         
+        # Debug: log sigma values and ratio calculation
+        if torch.isnan(ratio) or torch.isinf(ratio):
+            logger.warning(f"NaN/Inf ratio calculation detected for sample {i}:")
+            logger.warning(f"  current_sigmas[{i}]: {current_sigmas[i]}")
+            logger.warning(f"  next_sigmas[{i}]: {next_sigmas[i]}")
+            logger.warning(f"  pipeline.relative: {pipeline.relative}")
+            logger.warning(f"  ratio: {ratio}")
+        
         # Clamp ratio and check for NaN/inf
         ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
         if torch.isnan(ratio) or torch.isinf(ratio):
+            logger.warning(f"NaN/Inf in ratio after clamping for sample {i}: {ratio}")
             # Use a zero tensor that maintains gradients from time_preds
             zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
             log_probs_list.append(zero_logprob)
@@ -347,6 +428,15 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         
         # Compute the log probability
         time_predictor_log_prob = beta_dist.log_prob(ratio)
+        
+        # Debug: check for NaN in log probability computation
+        if torch.isnan(time_predictor_log_prob) or torch.isinf(time_predictor_log_prob):
+            logger.warning(f"NaN/Inf in beta distribution log_prob for sample {i}:")
+            logger.warning(f"  alpha: {alpha}")
+            logger.warning(f"  beta: {beta}")
+            logger.warning(f"  ratio: {ratio}")
+            logger.warning(f"  log_prob: {time_predictor_log_prob}")
+        
         log_probs_list.append(time_predictor_log_prob)
     
     # Stack all log probabilities into a single tensor that maintains gradients
@@ -1416,13 +1506,17 @@ def main(_):
                     with accelerator.accumulate(transformer):
                         with autocast():
                             
+                            # Create mask for active samples at this timestep
+                            timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
+                            active_mask = (j < timesteps_per_sample).bool()  # Shape: (batch_size,)
+                            
                             if not is_time_predictor_only_phase:
                                 # Full joint training: compute both diffusion and time predictor logprobs
-                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask)
                                 if config.train.beta > 0:
                                     with torch.no_grad():
                                         with transformer.module.disable_adapter():
-                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask)
                             else:
                                 # Time predictor only: skip diffusion logprob computation for efficiency
                                 diffusion_log_prob = torch.zeros_like(sample["log_probs"][:, j])
@@ -1433,11 +1527,22 @@ def main(_):
                             # Always compute time predictor logprobs (this is what we're training)
                             time_predictor_log_prob = compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config)
                             
+                            # Check for NaN/Inf in individual components before combining
+                            if not is_time_predictor_only_phase:
+                                if torch.isnan(diffusion_log_prob).any() or torch.isinf(diffusion_log_prob).any():
+                                    logger.warning(f"NaN/Inf detected in diffusion_log_prob component: {diffusion_log_prob}")
+                                    logger.warning(f"diffusion_log_prob stats: min={diffusion_log_prob.min()}, max={diffusion_log_prob.max()}, mean={diffusion_log_prob.mean()}")
+                            
+                            if torch.isnan(time_predictor_log_prob).any() or torch.isinf(time_predictor_log_prob).any():
+                                logger.warning(f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}")
+                                logger.warning(f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}")
+                            
                             # Compute time predictor KL divergence for regularization
                             time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
 
-                        # Create mask for active samples at this timestep
-                        active_mask = (j < timesteps_per_sample).float()  # Shape: (batch_size,)
+                        # Create mask for active samples at this timestep (remove duplicate)
+                        # active_mask already created above as boolean, convert to float for calculations
+                        active_mask_float = active_mask.float()  # Shape: (batch_size,)
                         
                         # Combine logprobs: diffusion logprobs + time predictor logprobs
                         if is_time_predictor_only_phase:
@@ -1445,10 +1550,30 @@ def main(_):
                             # Since diffusion model is frozen, diffusion logprobs cancel out in the ratio
                             current_log_prob = time_predictor_log_prob
                             reference_log_prob = sample["time_predictor_log_probs"][:, j] 
+                            
+                            # Check reference time predictor log probs
+                            if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
+                                logger.warning(f"NaN/Inf detected in reference time_predictor_log_probs: {reference_log_prob}")
+                                logger.warning(f"reference time_predictor_log_probs stats: min={reference_log_prob.min()}, max={reference_log_prob.max()}, mean={reference_log_prob.mean()}")
                         else:
                             # In joint training: combine both logprobs
                             current_log_prob = diffusion_log_prob + time_predictor_log_prob
                             reference_log_prob = sample["log_probs"][:, j] + sample["time_predictor_log_probs"][:, j]
+                            
+                            # Check reference log probs components
+                            if torch.isnan(sample["log_probs"][:, j]).any() or torch.isinf(sample["log_probs"][:, j]).any():
+                                logger.warning(f"NaN/Inf detected in reference diffusion log_probs: {sample['log_probs'][:, j]}")
+                                logger.warning(f"reference diffusion log_probs stats: min={sample['log_probs'][:, j].min()}, max={sample['log_probs'][:, j].max()}, mean={sample['log_probs'][:, j].mean()}")
+                            
+                            if torch.isnan(sample["time_predictor_log_probs"][:, j]).any() or torch.isinf(sample["time_predictor_log_probs"][:, j]).any():
+                                logger.warning(f"NaN/Inf detected in reference time_predictor_log_probs: {sample['time_predictor_log_probs'][:, j]}")
+                                logger.warning(f"reference time_predictor_log_probs stats: min={sample['time_predictor_log_probs'][:, j].min()}, max={sample['time_predictor_log_probs'][:, j].max()}, mean={sample['time_predictor_log_probs'][:, j].mean()}")
+                        
+                        # Check for NaN/Inf in log probabilities
+                        if torch.isnan(current_log_prob).any() or torch.isinf(current_log_prob).any():
+                            logger.warning(f"NaN/Inf detected in current_log_prob: {current_log_prob.mean()}")
+                        if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
+                            logger.warning(f"NaN/Inf detected in reference_log_prob: {reference_log_prob.mean()}")
                         
                         # grpo logic
                         advantages = torch.clamp(
@@ -1457,6 +1582,11 @@ def main(_):
                             config.train.adv_clip_max,
                         )
                         ratio = torch.exp(current_log_prob - reference_log_prob)
+                        
+                        # Check for NaN/Inf in ratio
+                        if torch.isnan(ratio).any() or torch.isinf(ratio).any():
+                            logger.warning(f"NaN/Inf detected in ratio: {ratio.mean()}, log_diff: {(current_log_prob - reference_log_prob).mean()}")
+                        
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,
@@ -1465,9 +1595,18 @@ def main(_):
                         )
                         
                         # Apply mask to set inactive entries to 0, then divide by timesteps per sample and take mean
-                        sample_losses = torch.maximum(unclipped_loss, clipped_loss) * active_mask
+                        sample_losses = torch.maximum(unclipped_loss, clipped_loss) * active_mask_float
                         # Element-wise division by timesteps per sample, then batch mean
                         policy_loss = torch.mean(sample_losses / timesteps_per_sample.float())
+                        
+                        # Check for NaN in policy_loss
+                        if torch.isnan(policy_loss) or torch.isinf(policy_loss):
+                            logger.warning(f"NaN/Inf detected in policy_loss: {policy_loss}, advantages: {advantages.mean()}, ratio: {ratio.mean()}")
+                            policy_loss = torch.tensor(0.0, device=policy_loss.device, requires_grad=True)
+                        
+                        # Check for NaN in diffusion_log_prob (when not in time_predictor_only_phase)
+                        if not is_time_predictor_only_phase and (torch.isnan(diffusion_log_prob).any() or torch.isinf(diffusion_log_prob).any()):
+                            logger.warning(f"NaN/Inf detected in diffusion_log_prob: {diffusion_log_prob.mean()}")
                         
                         # Compute KL losses
                         loss = policy_loss
@@ -1475,9 +1614,15 @@ def main(_):
                         # Add diffusion model KL regularization (only in joint training phase)
                         if config.train.beta > 0 and not is_time_predictor_only_phase:
                             kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
-                            kl_sample_losses = kl_loss.squeeze() * active_mask
+                            kl_sample_losses = kl_loss.squeeze() * active_mask_float
                             # Element-wise division by timesteps per sample, then batch mean
                             diffusion_kl_loss = torch.mean(kl_sample_losses / timesteps_per_sample.float())
+                            
+                            # Check for NaN in diffusion_kl_loss
+                            if torch.isnan(diffusion_kl_loss) or torch.isinf(diffusion_kl_loss):
+                                logger.warning(f"NaN/Inf detected in diffusion_kl_loss: {diffusion_kl_loss}, kl_loss: {kl_loss.mean()}, std_dev_t: {std_dev_t.mean()}")
+                                diffusion_kl_loss = torch.tensor(0.0, device=diffusion_kl_loss.device, requires_grad=True)
+                            
                             loss = loss + config.train.beta * diffusion_kl_loss
                         
                         # Add time predictor KL regularization (always active when training time predictor)
@@ -1485,29 +1630,35 @@ def main(_):
                         # to control the strength of time predictor KL regularization
                         time_predictor_kl_weight = getattr(config.train, 'time_predictor_kl_weight', 0.01)  # Default weight
                         if time_predictor_kl_weight > 0:
-                            time_predictor_kl_sample_losses = time_predictor_kl_div * active_mask
+                            time_predictor_kl_sample_losses = time_predictor_kl_div * active_mask_float
                             time_predictor_kl_loss = torch.mean(time_predictor_kl_sample_losses / timesteps_per_sample.float())
+                            
+                            # Check for NaN in time_predictor_kl_loss
+                            if torch.isnan(time_predictor_kl_loss) or torch.isinf(time_predictor_kl_loss):
+                                logger.warning(f"NaN/Inf detected in time_predictor_kl_loss: {time_predictor_kl_loss}, time_predictor_kl_div: {time_predictor_kl_div.mean()}")
+                                time_predictor_kl_loss = torch.tensor(0.0, device=time_predictor_kl_loss.device, requires_grad=True)
+                            
                             loss = loss + time_predictor_kl_weight * time_predictor_kl_loss
 
                         # Apply mask first, then compute mean over active entries only
-                        masked_log_prob_diff = (current_log_prob - reference_log_prob) ** 2 * active_mask
+                        masked_log_prob_diff = (current_log_prob - reference_log_prob) ** 2 * active_mask_float
                         info["approx_kl"].append(
-                            0.5 * torch.sum(masked_log_prob_diff) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
+                            0.5 * torch.sum(masked_log_prob_diff) / torch.sum(active_mask_float) if torch.sum(active_mask_float) > 0 else torch.tensor(0.0, device=active_mask_float.device)
                         )
                         
-                        masked_clipfrac = ((torch.abs(ratio - 1.0) > config.train.clip_range).float() * active_mask)
+                        masked_clipfrac = ((torch.abs(ratio - 1.0) > config.train.clip_range).float() * active_mask_float)
                         info["clipfrac"].append(
-                            torch.sum(masked_clipfrac) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
+                            torch.sum(masked_clipfrac) / torch.sum(active_mask_float) if torch.sum(active_mask_float) > 0 else torch.tensor(0.0, device=active_mask_float.device)
                         )
                         
-                        masked_clipfrac_gt_one = ((ratio - 1.0 > config.train.clip_range).float() * active_mask)
+                        masked_clipfrac_gt_one = ((ratio - 1.0 > config.train.clip_range).float() * active_mask_float)
                         info["clipfrac_gt_one"].append(
-                            torch.sum(masked_clipfrac_gt_one) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
+                            torch.sum(masked_clipfrac_gt_one) / torch.sum(active_mask_float) if torch.sum(active_mask_float) > 0 else torch.tensor(0.0, device=active_mask_float.device)
                         )
                         
-                        masked_clipfrac_lt_one = ((1.0 - ratio > config.train.clip_range).float() * active_mask)
+                        masked_clipfrac_lt_one = ((1.0 - ratio > config.train.clip_range).float() * active_mask_float)
                         info["clipfrac_lt_one"].append(
-                            torch.sum(masked_clipfrac_lt_one) / torch.sum(active_mask) if torch.sum(active_mask) > 0 else torch.tensor(0.0, device=active_mask.device)
+                            torch.sum(masked_clipfrac_lt_one) / torch.sum(active_mask_float) if torch.sum(active_mask_float) > 0 else torch.tensor(0.0, device=active_mask_float.device)
                         )
                         info["policy_loss"].append(policy_loss)
                         if config.train.beta > 0 and not is_time_predictor_only_phase:
@@ -1526,6 +1677,11 @@ def main(_):
                         info["combined_log_prob_mean"].append(current_log_prob.mean())
 
                         info["loss"].append(loss)
+
+                        # Final check for NaN/Inf in total loss before backward pass
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            logger.warning(f"NaN/Inf detected in total loss: {loss}. Skipping backward pass for this step.")
+                            continue  # Skip this training step
 
                         # backward pass
                         accelerator.backward(loss)

@@ -69,14 +69,36 @@ def sde_step_with_logprob(
         
     dt = sigma_prev - sigma
     
+    # Debug: Always show sigma values for monitoring
+    print(f"sigma: {sigma.flatten()}")
+    print(f"sigma_prev: {sigma_prev.flatten()}")
+    
+    # Debug: Check dt values for potential issues
+    if torch.isnan(dt).any() or torch.isinf(dt).any():
+        print(f"NaN/Inf detected in dt: {dt}")
+    # Note: dt should be negative for denoising (sigma_prev - sigma < 0), but when both are 0, dt=0 is expected
+    if (dt > 0).any():  # Only warn for strictly positive dt (excluding zero)
+        positive_dt_mask = dt > 0
+        print(f"Warning: Positive dt detected (should be negative for denoising): {dt[positive_dt_mask]}")
+
     std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*noise_level
+    
+    # Debug: Check intermediate calculations for std_dev_t
+    denominator = (1 - torch.where(sigma == 1, sigma_max, sigma))
+    if (denominator <= 0).any():
+        print(f"Warning: Non-positive denominator in std_dev_t calculation: {denominator.flatten()}")
+        print(f"sigma: {sigma.flatten()}")
+        print(f"sigma_max: {sigma_max.flatten()}")
+    
+    ratio_term = sigma / denominator
+    if torch.isnan(ratio_term).any() or torch.isinf(ratio_term).any() or (ratio_term < 0).any():
+        print(f"Warning: Invalid ratio_term for sqrt: {ratio_term.flatten()}")
     
     # Fix: Handle the case where sigma=0 or very small, which makes std_dev_t=0
     # When sigma is 0 or very small, use a minimum threshold for numerical stability
     min_std_dev = 1e-6  # Minimum standard deviation to prevent division by zero
     std_dev_t = torch.clamp(std_dev_t, min=min_std_dev)
     
-    # our sde
     # Fix: Handle division by zero when sigma=0 in the prev_sample_mean calculation
     # When sigma=0, the terms involving division by sigma should be handled carefully
     safe_sigma = torch.clamp(sigma, min=1e-8)  # Prevent division by zero
@@ -101,18 +123,21 @@ def sde_step_with_logprob(
                                       prev_sample_mean, 
                                       original_sample)
 
-    # Safety fixes for numerical stability in log probability calculation
+    # Debug: Check log probability calculation components for critical issues
     sqrt_neg_dt = torch.sqrt(-1*dt)
-    # Ensure dt is sufficiently negative to avoid sqrt of negative values  
-    if (dt >= 0).any():
-        dt = torch.clamp(dt, max=-1e-8)
+    if torch.isnan(sqrt_neg_dt).any() or torch.isinf(sqrt_neg_dt).any():
+        print(f"NaN/Inf detected in sqrt(-dt): {sqrt_neg_dt.flatten()}")
+        # Temporary fix: clamp dt to ensure -dt is positive
+        dt = torch.clamp(dt, max=-1e-8)  # Ensure dt is sufficiently negative
         sqrt_neg_dt = torch.sqrt(-1*dt)
     
     variance_term = std_dev_t * sqrt_neg_dt
-    # Ensure variance_term is positive for log calculation
     if (variance_term <= 0).any():
+        print(f"Warning: Non-positive variance_term for log: {variance_term.flatten()}")
+        # Temporary fix: clamp to positive values
         variance_term = torch.clamp(variance_term, min=1e-8)
     
+    # Compute log_prob with proper numerical stability
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (variance_term**2))
         - torch.log(variance_term)
