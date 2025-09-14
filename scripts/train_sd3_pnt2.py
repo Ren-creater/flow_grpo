@@ -266,7 +266,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     # Debug: Check inputs to sde_step_with_logprob
     current_timesteps = sample["timesteps"][:, j]
     current_latents = sample["latents"][:, j].float()
-    next_latents = sample["next_latents"][:, j].float()
+    next_latents = sample["latents"][:, j+1].float()  # Use index-based access instead of separate tensor
     
     if torch.isnan(current_timesteps).any() or torch.isinf(current_timesteps).any():
         logger.warning(f"NaN/Inf detected in current_timesteps at timestep {j}: {current_timesteps}")
@@ -1154,12 +1154,8 @@ def main(_):
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "timesteps": timesteps,
                     "timesteps_per_sample": timesteps_per_sample,
-                    "latents": latents[
-                        :, :-1
-                    ],  # each entry is the latent before timestep t
-                    "next_latents": latents[
-                        :, 1:
-                    ],  # each entry is the latent after timestep t
+                    "latents": latents,  # Store full latents tensor (no slicing to save memory)
+                    # Note: next_latents removed - will use latents[:, j+1] when needed
                     "log_probs": log_probs,
                     "time_predictor_log_probs": time_predictor_log_probs,
                     "hidden_states_combineds": hidden_states_combineds,
@@ -1200,17 +1196,22 @@ def main(_):
                 
                 # Use more memory-efficient padding by pre-allocating full-size tensors
                 # and copying data instead of concatenating
-                for key in ["latents", "next_latents"]:
-                    if key in sample:
-                        original_tensor = sample[key]
-                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                        # Create new tensor with full size
-                        full_shape = [original_tensor.shape[0], max_timesteps] + list(original_tensor.shape[2:])
-                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
-                        # Copy original data using actual tensor dimensions
-                        new_tensor[:, :actual_timesteps] = original_tensor
-                        sample[key] = new_tensor
-                        del original_tensor  # Explicit cleanup
+                # Handle latents separately since it has num_steps + 1 timesteps
+                if "latents" in sample:
+                    original_tensor = sample["latents"]
+                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
+                    # For latents, we need max_timesteps + 1 to maintain the +1 offset
+                    full_shape = [original_tensor.shape[0], max_timesteps + 1] + list(original_tensor.shape[2:])
+                    new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
+                    # Copy original data using actual tensor dimensions
+                    new_tensor[:, :actual_timesteps] = original_tensor
+                    # Fill padding with last latent value
+                    if actual_timesteps > 0:
+                        last_latent = original_tensor[:, -1:]
+                        pad_size_actual = (max_timesteps + 1) - actual_timesteps
+                        new_tensor[:, actual_timesteps:] = last_latent.repeat(1, pad_size_actual, 1, 1, 1)
+                    sample["latents"] = new_tensor
+                    del original_tensor  # Explicit cleanup
                 
                 # Same for log_probs and time_predictor_log_probs
                 for logprob_key in ["log_probs", "time_predictor_log_probs"]:
