@@ -63,7 +63,7 @@ def get_config():
     # whether to use the 8bit Adam optimizer from bitsandbytes.
     train.use_8bit_adam = False
     # learning rate.
-    train.learning_rate = 3e-4
+    train.learning_rate = 3e-3
     # Adam beta1.
     train.adam_beta1 = 0.9
     # Adam beta2.

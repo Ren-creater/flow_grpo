@@ -53,9 +53,9 @@ def sde_step_with_logprob(
     
     # Handle inactive samples: replace sigma=0 with safe values to prevent NaN
     if active_mask is not None:
-        # For inactive samples, use sigma=0.5 (a safe middle value) to prevent division by zero
-        safe_sigma = torch.where(active_mask, sigma, torch.tensor(0.5, device=sigma.device, dtype=sigma.dtype))
-        safe_sigma_prev = torch.where(active_mask, sigma_prev, torch.tensor(0.4, device=sigma_prev.device, dtype=sigma_prev.dtype))
+        # For inactive samples, use sigma=0.01 (a safe small value) to prevent division by zero
+        safe_sigma = torch.where(active_mask, sigma, torch.tensor(0.01, device=sigma.device, dtype=sigma.dtype))
+        safe_sigma_prev = torch.where(active_mask, sigma_prev, torch.tensor(0.01, device=sigma_prev.device, dtype=sigma_prev.dtype))
     else:
         safe_sigma = sigma
         safe_sigma_prev = sigma_prev
@@ -70,8 +70,8 @@ def sde_step_with_logprob(
     dt = sigma_prev - sigma
     
     # Debug: Always show sigma values for monitoring
-    print(f"sigma: {sigma.flatten()}")
-    print(f"sigma_prev: {sigma_prev.flatten()}")
+    #print(f"sigma: {sigma.flatten()}")
+    #print(f"sigma_prev: {sigma_prev.flatten()}")
     
     # Debug: Check dt values for potential issues
     if torch.isnan(dt).any() or torch.isinf(dt).any():

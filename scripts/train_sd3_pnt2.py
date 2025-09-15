@@ -789,7 +789,7 @@ def main(_):
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     time_predictor_parameters = list(pipeline.time_predictor.parameters())
     all_trainable_parameters = transformer_trainable_parameters + time_predictor_parameters
-    # This ema setting affects the previous 20 × 8 = 160 steps on average.
+    # This ema setting affects the previous 2 × 8 = 160 steps on average.
     ema = EMAModuleWrapper(all_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
     
     # Enable TF32 for faster training on Ampere GPUs,
@@ -1509,7 +1509,7 @@ def main(_):
                 ):
                     # Create mask for active samples at this timestep
                     timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
-                    active_mask = (j < timesteps_per_sample).bool()  # Shape: (batch_size,)
+                    active_mask = (j < timesteps_per_sample - 1).bool()  # Shape: (batch_size,)
                     
                     # Skip timesteps where no samples are active (all have reached their endpoint)
                     if not active_mask.any():
@@ -1741,4 +1741,3 @@ def main(_):
         
 if __name__ == "__main__":
     app.run(main)
-
