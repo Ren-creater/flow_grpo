@@ -8,6 +8,7 @@ import torchvision.transforms as T
 from transformers import AutoImageProcessor,CLIPProcessor, CLIPModel
 import numpy as np
 from PIL import Image
+import os
 
 def get_size(size):
     if isinstance(size, int):
@@ -31,8 +32,10 @@ class ClipScorer(torch.nn.Module):
     def __init__(self, device):
         super().__init__()
         self.device=device
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        processor_path = os.path.expanduser("~/flow_grpo/clip-vit-large-patch14") #"openai/clip-vit-large-patch14"
+        model_path = os.path.expanduser("~/flow_grpo/clip-vit-large-patch14") #"openai/clip-vit-large-patch14"
+        self.model = CLIPModel.from_pretrained(model_path).to(device)
+        self.processor = CLIPProcessor.from_pretrained(processor_path)
         self.tform = get_image_transform(self.processor.image_processor)
         self.eval()
     
