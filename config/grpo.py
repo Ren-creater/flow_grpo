@@ -552,7 +552,7 @@ def general_ocr_sd3_pnt_1gpu():
 def general_ocr_sd3_5_pnt_1gpu():
     config = general_ocr_sd3_1gpu()
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-1gpu'
 
     # Add time predictor checkpoint path for resuming
@@ -568,7 +568,7 @@ def general_ocr_sd3_5_pnt_1gpu_big():
     config.sample.num_steps = 40
     config.sample.eval_num_steps = 40
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-1gpu-big'
 
     # Add time predictor checkpoint path for resuming
@@ -583,7 +583,7 @@ def general_ocr_sd3_5_pnt_1gpu_maxE():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-1gpu-max'
 
     # Add time predictor checkpoint path for resuming
@@ -599,7 +599,7 @@ def general_ocr_sd3_5_pnt_1gpu_max():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-1gpu-max'
 
     # Add time predictor checkpoint path for resuming
@@ -612,7 +612,7 @@ def general_ocr_sd3_5_pnt_1gpu_max():
 def general_ocr_sd3_5_pnt_1gpu_vit():
     config = general_ocr_sd3_1gpu()
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit-1gpu'
 
     # Add time predictor checkpoint path for resuming
@@ -642,7 +642,7 @@ def general_ocr_sd3_pnt():
 def general_ocr_sd3_5_pnt():
     config = general_ocr_sd3()
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt'
 
     # Add time predictor checkpoint path for resuming
@@ -658,7 +658,7 @@ def general_ocr_sd3_5_pnt_big():
     config.sample.num_steps = 40
     config.sample.eval_num_steps = 40
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-big'
 
     # Add time predictor checkpoint path for resuming
@@ -674,7 +674,7 @@ def general_ocr_sd3_5_pnt_max():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
@@ -768,15 +768,20 @@ def general_ocr_sd3_8gpu():
     gpu_number = 8
     config = compressibility()
     config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
+
+    # sd3.5 medium
     config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
     config.sample.num_steps = 10
     config.sample.eval_num_steps = 40
     config.sample.guidance_scale = 4.5
+
     config.resolution = 512
-    config.sample.train_batch_size = 9
-    config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
-    config.sample.test_batch_size = 16
+    config.sample.train_batch_size = 7
+    config.sample.num_image_per_prompt = 14
+    config.sample.num_batches_per_epoch = int(16/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
+    config.sample.test_batch_size = 16 # Optimized for OCR test set (1018 samples)
+
     config.train.batch_size = config.sample.train_batch_size
     config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
     config.train.num_inner_epochs = 1
@@ -785,22 +790,23 @@ def general_ocr_sd3_8gpu():
     config.sample.global_std = True
     config.sample.same_latent = False
     config.train.ema = True
-    config.save_freq = 60
+    config.save_freq = 60 # epoch
     config.eval_freq = 60
     config.save_dir = 'logs/ocr/sd3.5-M'
-    config.reward_fn = {"ocr": 1.0}
+    config.reward_fn = {
+        "ocr": 1.0,
+    }
+    
     config.prompt_fn = "general_ocr"
     config.per_prompt_stat_tracking = True
-    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-Text")
-
     return config
 
 def general_ocr_sd3_5_pnt_max():
-    config = general_ocr_sd3()
+    config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
@@ -811,11 +817,11 @@ def general_ocr_sd3_5_pnt_max():
     return config
 
 def general_ocr_sd3_5_pnt_maxE():
-    config = general_ocr_sd3()
+    config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
@@ -827,11 +833,11 @@ def general_ocr_sd3_5_pnt_maxE():
     return config
 
 def general_ocr_sd3_5_pnt_vit():
-    config = general_ocr_sd3()
+    config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming
@@ -856,11 +862,11 @@ def pickscore_sd3_8gpu():
     config.sample.guidance_scale = 4.5
 
     config.resolution = 512
-    config.sample.train_batch_size = 9
-    config.sample.num_image_per_prompt = 24
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.train_batch_size = 7
+    config.sample.num_image_per_prompt = 14
+    config.sample.num_batches_per_epoch = int(16/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
-    config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
+    config.sample.test_batch_size = 16 # Optimized for PickScore test set (2048 samples)
 
     config.train.batch_size = config.sample.train_batch_size
     config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
@@ -878,16 +884,15 @@ def pickscore_sd3_8gpu():
     }
     
     config.prompt_fn = "general_ocr"
-
     config.per_prompt_stat_tracking = True
     return config
 
 def pickscore_sd3_5_pnt_max():
-    config = pickscore_sd3()
+    config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
@@ -898,11 +903,11 @@ def pickscore_sd3_5_pnt_max():
     return config
 
 def pickscore_sd3_5_pnt_maxE():
-    config = pickscore_sd3()
+    config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
@@ -914,11 +919,11 @@ def pickscore_sd3_5_pnt_maxE():
     return config
 
 def pickscore_sd3_5_pnt_vit():
-    config = pickscore_sd3()
+    config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.pretrained.model = os.path.expanduser("/home/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming

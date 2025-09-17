@@ -77,22 +77,22 @@ def sde_step_with_logprob(
     if torch.isnan(dt).any() or torch.isinf(dt).any():
         print(f"NaN/Inf detected in dt: {dt}")
     # Note: dt should be negative for denoising (sigma_prev - sigma < 0), but when both are 0, dt=0 is expected
-    if (dt > 0).any():  # Only warn for strictly positive dt (excluding zero)
-        positive_dt_mask = dt > 0
-        print(f"Warning: Positive dt detected (should be negative for denoising): {dt[positive_dt_mask]}")
+    # if (dt > 0).any():  # Only warn for strictly positive dt (excluding zero)
+    #     positive_dt_mask = dt > 0
+    #     print(f"Warning: Positive dt detected (should be negative for denoising): {dt[positive_dt_mask]}")
 
     std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*noise_level
     
     # Debug: Check intermediate calculations for std_dev_t
     denominator = (1 - torch.where(sigma == 1, sigma_max, sigma))
-    if (denominator <= 0).any():
-        print(f"Warning: Non-positive denominator in std_dev_t calculation: {denominator.flatten()}")
-        print(f"sigma: {sigma.flatten()}")
-        print(f"sigma_max: {sigma_max.flatten()}")
+    # if (denominator <= 0).any():
+    #     print(f"Warning: Non-positive denominator in std_dev_t calculation: {denominator.flatten()}")
+    #     print(f"sigma: {sigma.flatten()}")
+    #     print(f"sigma_max: {sigma_max.flatten()}")
     
     ratio_term = sigma / denominator
-    if torch.isnan(ratio_term).any() or torch.isinf(ratio_term).any() or (ratio_term < 0).any():
-        print(f"Warning: Invalid ratio_term for sqrt: {ratio_term.flatten()}")
+    # if torch.isnan(ratio_term).any() or torch.isinf(ratio_term).any() or (ratio_term < 0).any():
+    #     print(f"Warning: Invalid ratio_term for sqrt: {ratio_term.flatten()}")
     
     # Fix: Handle the case where sigma=0 or very small, which makes std_dev_t=0
     # When sigma is 0 or very small, use a minimum threshold for numerical stability
