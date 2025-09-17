@@ -120,6 +120,8 @@ def general_ocr_sd3():
     config.prompt_fn = "general_ocr"
 
     config.per_prompt_stat_tracking = True
+    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-Text")
+
     return config
 
 def geneval_sd3():
@@ -158,6 +160,7 @@ def geneval_sd3():
     config.prompt_fn = "geneval"
 
     config.per_prompt_stat_tracking = True
+    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-GenEval")
     return config
 
 def pickscore_sd3():
@@ -196,6 +199,7 @@ def pickscore_sd3():
     config.prompt_fn = "general_ocr"
 
     config.per_prompt_stat_tracking = True
+    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-PickScore")
     return config
 
 def clipscore_sd3():
@@ -791,13 +795,13 @@ def general_ocr_sd3_8gpu():
 
     return config
 
-def general_ocr_sd3_5_pnt_8gpu_max():
-    config = general_ocr_sd3_8gpu()
+def general_ocr_sd3_5_pnt_max():
+    config = general_ocr_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/ocr/sd3-5-M-pnt-8gpu-max'
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
@@ -806,13 +810,13 @@ def general_ocr_sd3_5_pnt_8gpu_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def general_ocr_sd3_5_pnt_8gpu_maxE():
-    config = general_ocr_sd3_8gpu()
+def general_ocr_sd3_5_pnt_maxE():
+    config = general_ocr_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/ocr/sd3-5-M-pnt-8gpu-maxe'
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
@@ -822,13 +826,13 @@ def general_ocr_sd3_5_pnt_8gpu_maxE():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def general_ocr_sd3_5_pnt_8gpu_vit():
-    config = general_ocr_sd3_8gpu()
+def general_ocr_sd3_5_pnt_vit():
+    config = general_ocr_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit-8gpu'
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
@@ -878,13 +882,13 @@ def pickscore_sd3_8gpu():
     config.per_prompt_stat_tracking = True
     return config
 
-def pickscore_sd3_5_pnt_8gpu_max():
-    config = pickscore_sd3_8gpu()
+def pickscore_sd3_5_pnt_max():
+    config = pickscore_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-8gpu-max'
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
@@ -893,13 +897,13 @@ def pickscore_sd3_5_pnt_8gpu_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def pickscore_sd3_5_pnt_8gpu_maxE():
-    config = pickscore_sd3_8gpu()
+def pickscore_sd3_5_pnt_maxE():
+    config = pickscore_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-8gpu-maxe'
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
@@ -909,13 +913,13 @@ def pickscore_sd3_5_pnt_8gpu_maxE():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def pickscore_sd3_5_pnt_8gpu_vit():
-    config = pickscore_sd3_8gpu()
+def pickscore_sd3_5_pnt_vit():
+    config = pickscore_sd3()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
-    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit-8gpu'
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
