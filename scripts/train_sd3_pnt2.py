@@ -8,6 +8,7 @@ import json
 import hashlib
 import gc
 import psutil
+import torch.distributed as dist
 from absl import app, flags
 from accelerate import Accelerator
 from ml_collections import config_flags
@@ -27,7 +28,7 @@ from flow_grpo.diffusers_patch.sd3_pnt_pipeline_with_logprob import pipeline_wit
 from flow_grpo.diffusers_patch.sd3_pnt_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
-import wandb
+import swanlab as wandb
 from functools import partial
 import tqdm
 import tempfile
@@ -1184,143 +1185,159 @@ def main(_):
         del latents, log_probs, time_predictor_log_probs, sigmas, timesteps
         gc.collect()
 
-        # Pad tensors to the same length before collation to handle variable timesteps
-        # Note: latents now has shape (batch_size, num_steps + 1) 
-        # while log_probs have (batch_size, num_steps)
-        # sigmas has shape (batch_size, num_steps + 1) like latents
-        max_timesteps_latents = max(s["latents"].shape[1] for s in samples)  # This is num_steps + 1
-        max_timesteps_logprobs = max_timesteps_latents - 1  # This is num_steps for log_probs
-        
+        # Compute global max timesteps (latents has num_steps+1) across all ranks
+        local_max_latents = max(s["latents"].shape[1] for s in samples)
+        local_max_latents_tensor = torch.tensor(local_max_latents, device=accelerator.device, dtype=torch.int64)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_max_latents_tensor, op=dist.ReduceOp.MAX)
+        global_max_timesteps_latents = int(local_max_latents_tensor.item())  # L
+        global_max_timesteps_logprobs = global_max_timesteps_latents - 1      # L-1
+        if accelerator.is_local_main_process:
+            print(f"[DEBUG] global_max_timesteps_latents={global_max_timesteps_latents}")
+
+        # Helper utilities -------------------------------------------------
+        def _repeat_last_pad(t: torch.Tensor, target_len: int, dim: int = 1):
+            cur = t.shape[dim]
+            if cur == target_len:
+                return t
+            if cur > target_len:
+                # Truncate (should rarely happen but guard anyway)
+                slicer = [slice(None)] * t.ndim
+                slicer[dim] = slice(0, target_len)
+                return t[tuple(slicer)]
+            # Pad by repeating the last slice
+            last_slice = t.select(dim, cur - 1).unsqueeze(dim)
+            pad_count = target_len - cur
+            pad_tensor = last_slice.repeat([1 if d != dim else pad_count for d in range(t.ndim)])
+            return torch.cat([t, pad_tensor], dim=dim)
+
+        def _zero_pad(t: torch.Tensor, target_len: int, dim: int = 1):
+            cur = t.shape[dim]
+            if cur == target_len:
+                return t
+            if cur > target_len:
+                slicer = [slice(None)] * t.ndim
+                slicer[dim] = slice(0, target_len)
+                return t[tuple(slicer)]
+            shape_new = list(t.shape)
+            shape_new[dim] = target_len
+            out = t.new_zeros(shape_new)
+            slicer = [slice(None)] * t.ndim
+            slicer[dim] = slice(0, cur)
+            out[tuple(slicer)] = t
+            return out
+
+        # Normalize ALL sequence-length dependent tensors irrespective of whether latents already max-length.
         for sample in samples:
-            current_timesteps_latents = sample["latents"].shape[1]
-            if current_timesteps_latents < max_timesteps_latents:
-                
-                # Use more memory-efficient padding by pre-allocating full-size tensors
-                # and copying data instead of concatenating
-                # Handle latents - it already has num_steps + 1 timesteps
-                if "latents" in sample:
-                    original_tensor = sample["latents"]
-                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    # For latents, pad to max_timesteps_latents
-                    full_shape = [original_tensor.shape[0], max_timesteps_latents] + list(original_tensor.shape[2:])
-                    new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
-                    # Copy original data using actual tensor dimensions
-                    new_tensor[:, :actual_timesteps] = original_tensor
-                    # Fill padding with last latent value
-                    if actual_timesteps > 0:
-                        last_latent = original_tensor[:, -1:]
-                        pad_size_actual = max_timesteps_latents - actual_timesteps
-                        new_tensor[:, actual_timesteps:] = last_latent.repeat(1, pad_size_actual, 1, 1, 1)
-                    sample["latents"] = new_tensor
-                    del original_tensor  # Explicit cleanup
-                
-                # Same for log_probs and time_predictor_log_probs (they have num_steps)
-                for logprob_key in ["log_probs", "time_predictor_log_probs"]:
-                    if logprob_key in sample:
-                        original_tensor = sample[logprob_key]
-                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                        full_shape = [original_tensor.shape[0], max_timesteps_logprobs]
-                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
-                        new_tensor[:, :actual_timesteps] = original_tensor
-                        sample[logprob_key] = new_tensor
-                        del original_tensor  # Explicit cleanup
-                
-                # More memory-efficient padding for hidden_states_combineds and tembs (they have num_steps)
-                for tensor_key in ["hidden_states_combineds", "tembs"]:
-                    if tensor_key in sample:
-                        original_tensor = sample[tensor_key]
-                        actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                        full_shape = [original_tensor.shape[0], max_timesteps_logprobs] + list(original_tensor.shape[2:])
-                        new_tensor = torch.zeros(full_shape, device=original_tensor.device, dtype=original_tensor.dtype)
-                        new_tensor[:, :actual_timesteps] = original_tensor
-                        sample[tensor_key] = new_tensor
-                        del original_tensor  # Explicit cleanup
-                
-                # Pad timesteps - use the last timestep value for padding (they have num_steps)
-                if "timesteps" in sample:
-                    original_tensor = sample["timesteps"]
-                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_logprobs], 
-                                           device=original_tensor.device, dtype=original_tensor.dtype)
-                    new_tensor[:, :actual_timesteps] = original_tensor
-                    # Fill padding with last timestep value
-                    if actual_timesteps > 0:
-                        last_timestep = original_tensor[:, -1:]
-                        pad_size_actual = max_timesteps_logprobs - actual_timesteps
-                        new_tensor[:, actual_timesteps:] = last_timestep.repeat(1, pad_size_actual)
-                    sample["timesteps"] = new_tensor
-                    del original_tensor  # Explicit cleanup
-                
-                # Pad sigmas - they have num_steps + 1 elements like latents
-                if "sigmas" in sample:
-                    original_tensor = sample["sigmas"]
-                    actual_timesteps = original_tensor.shape[1]  # Use actual tensor dimension
-                    new_tensor = torch.zeros([original_tensor.shape[0], max_timesteps_latents], 
-                                           device=original_tensor.device, dtype=original_tensor.dtype)
-                    new_tensor[:, :actual_timesteps] = original_tensor
-                    # Fill padding with last sigma value
-                    if actual_timesteps > 0:
-                        last_sigma = original_tensor[:, -1:]
-                        pad_size_actual = max_timesteps_latents - actual_timesteps
-                        new_tensor[:, actual_timesteps:] = last_sigma.repeat(1, pad_size_actual)
-                    sample["sigmas"] = new_tensor
-                    del original_tensor  # Explicit cleanup
+            # latents: length L (num_steps+1) -> repeat-last pad
+            sample["latents"] = _repeat_last_pad(sample["latents"], global_max_timesteps_latents, dim=1)
 
-        # Force garbage collection before collation
+            # sigmas: length L (align with latents)
+            if "sigmas" in sample:
+                sample["sigmas"] = _repeat_last_pad(sample["sigmas"], global_max_timesteps_latents, dim=1)
+
+            # Tensors of length L-1
+            for key in ["log_probs", "time_predictor_log_probs"]:
+                if key in sample:
+                    sample[key] = _zero_pad(sample[key], global_max_timesteps_logprobs, dim=1)
+
+            for key in ["hidden_states_combineds", "tembs"]:
+                if key in sample:
+                    t = sample[key]
+                    if t.device.type != 'cpu':  # move to CPU as before
+                        t = t.cpu()
+                    sample[key] = _zero_pad(t, global_max_timesteps_logprobs, dim=1)
+
+            if "timesteps" in sample:
+                # timesteps are scalar per step; pad by repeating last
+                sample["timesteps"] = _repeat_last_pad(sample["timesteps"], global_max_timesteps_logprobs, dim=1)
+
+            # Safety: enforce timesteps_per_sample <= global_max_timesteps_logprobs
+            if "timesteps_per_sample" in sample:
+                tps = sample["timesteps_per_sample"]
+                if (tps > global_max_timesteps_logprobs).any():
+                    raise RuntimeError(f"timesteps_per_sample has value > global_max ({tps.max().item()} > {global_max_timesteps_logprobs})")
+
+        # Verification prior to collation to prevent later deadlocks --------
+        if accelerator.is_local_main_process:
+            for idx, s in enumerate(samples):
+                lens = {
+                    'latents': s['latents'].shape[1],
+                    'sigmas': s['sigmas'].shape[1] if 'sigmas' in s else None,
+                    'log_probs': s['log_probs'].shape[1] if 'log_probs' in s else None,
+                    'time_predictor_log_probs': s['time_predictor_log_probs'].shape[1] if 'time_predictor_log_probs' in s else None,
+                    'hidden_states_combineds': s['hidden_states_combineds'].shape[1] if 'hidden_states_combineds' in s else None,
+                    'tembs': s['tembs'].shape[1] if 'tembs' in s else None,
+                    'timesteps': s['timesteps'].shape[1] if 'timesteps' in s else None,
+                }
+                for k_expect, v in lens.items():
+                    if v is None:
+                        continue
+                    target = global_max_timesteps_latents if k_expect in ['latents','sigmas'] else global_max_timesteps_logprobs
+                    if v != target:
+                        raise RuntimeError(f"[SHAPE_ASSERT] sample_idx={idx} key={k_expect} length={v} expected={target}")
+
         gc.collect()
 
-        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-        samples = {
-            k: torch.cat([s[k] for s in samples], dim=0)
-            if not isinstance(samples[0][k], dict)
-            else {
-                sub_key: torch.cat([s[k][sub_key] for s in samples], dim=0)
-                for sub_key in samples[0][k]
-            }
-            for k in samples[0].keys()
-        }
+        # Debug function to print shapes/devices per key before collation
+        def _debug_sample_shapes(samples_list):
+            for idx, s in enumerate(samples_list):
+                print(f"[DEBUG] rank={accelerator.process_index} sample_idx={idx}")
+                for k,v in s.items():
+                    if isinstance(v, dict):
+                        for sk, sv in v.items():
+                            print(f"  key={k}.{sk} shape={tuple(sv.shape)} device={sv.device} dtype={sv.dtype}")
+                    else:
+                        # futures already resolved
+                        if hasattr(v, 'shape'):
+                            print(f"  key={k} shape={tuple(v.shape)} device={v.device} dtype={v.dtype}")
+        if accelerator.is_local_main_process:
+            print("[DEBUG] Before collation sample stats:")
+            _debug_sample_shapes(samples)
 
-        if epoch % 10 == 0 and accelerator.is_main_process:
-            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-            with tempfile.TemporaryDirectory() as tmpdir:
-                num_samples = min(15, len(images))
-                sample_indices = random.sample(range(len(images)), num_samples)
+        # Collate with per-key try/except to isolate failures
+        collated = {}
+        for k in samples[0].keys():
+            if not isinstance(samples[0][k], dict):
+                try:
+                    tensors = [s[k] for s in samples]
+                    # Ensure all on same device for GPU tensors; CPU allowed for hidden states
+                    if k not in ["hidden_states_combineds", "tembs"]:
+                        target_device = tensors[0].device
+                        tensors = [t.to(target_device) for t in tensors]
+                    collated[k] = torch.cat(tensors, dim=0)
+                except Exception as e:
+                    print(f"[ERROR] Concatenation failed for key={k}: {e}")
+                    for ti, tv in enumerate(tensors):
+                        print(f"  tensor[{ti}] shape={tuple(tv.shape)} device={tv.device} dtype={tv.dtype}")
+                    raise
+            else:
+                sub_dict = {}
+                for sub_key in samples[0][k].keys():
+                    try:
+                        tensors = [s[k][sub_key] for s in samples]
+                        if sub_key not in ["hidden_states_combineds", "tembs"]:
+                            target_device = tensors[0].device
+                            tensors = [t.to(target_device) for t in tensors]
+                        sub_dict[sub_key] = torch.cat(tensors, dim=0)
+                    except Exception as e:
+                        print(f"[ERROR] Concatenation failed for key={k}.{sub_key}: {e}")
+                        for ti, tv in enumerate(tensors):
+                            print(f"  tensor[{ti}] shape={tuple(tv.shape)} device={tv.device} dtype={tv.dtype}")
+                        raise
+                collated[k] = sub_dict
+        samples = collated
 
-                for idx, i in enumerate(sample_indices):
-                    image = images[i]
-                    pil = Image.fromarray(
-                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                    )
-                    pil = pil.resize((config.resolution, config.resolution))
-                    pil.save(os.path.join(tmpdir, f"{idx}.jpg"))  # 使用新的索引
+        # Debug: ensure identical shapes across ranks before reward gather
+        if accelerator.is_local_main_process:
+            print("[DEBUG] rewards keys:", list(samples["rewards"].keys()))
+            for rk, rv in samples["rewards"].items():
+                print("[DEBUG] reward tensor shape pre-expand", rk, rv.shape)
 
-                sampled_prompts = [prompts[i] for i in sample_indices]
-                sampled_rewards = [rewards['avg'][i] for i in sample_indices]
-
-                wandb.log(
-                    {
-                        "images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
-                            )
-                            for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
-                        ],
-                    },
-                    step=global_step,
-                )
-        
-        # Clean up rewards and images after WandB logging
-        del rewards, reward_metadata
-        del images  # Free large image tensor
-        gc.collect()
-        
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # Get maximum padded timesteps and actual timesteps per sample
-        # latents has shape (batch_size, num_steps + 1), but rewards need to match timesteps (num_steps)
-        max_padded_timesteps_rewards = samples["latents"].shape[1] - 1  # Subtract 1 for rewards
-        timesteps_per_sample = samples["timesteps_per_sample"]  # Actual timesteps for each sample
-        
+        max_padded_timesteps_rewards = samples["latents"].shape[1] - 1
+        timesteps_per_sample = samples["timesteps_per_sample"]
         # Apply gamma discounting like in modeling_sd3_pnt.py reward function
         # Only apply during time predictor only training phase
         gamma = config.reward_gamma
@@ -1344,7 +1361,9 @@ def main(_):
         else:
             # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
             samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, max_padded_timesteps_rewards)
-        # gather rewards across processes
+    # gather rewards across processes
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
         gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
         # log rewards and images
