@@ -930,5 +930,105 @@ def pickscore_sd3_5_pnt_vit():
 
     return config
 
+################## FAST OCR ##################
+
+def general_ocr_sd3_fast_1gpu():
+    gpu_number = 1
+    config = compressibility()
+    config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
+
+    # sd3.5 medium
+    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.sample.num_steps = 10
+    config.sample.train_num_steps = 2
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 4.5
+
+    config.resolution = 512
+    # for fast mode we sample 1 prompt per device and expand mini images inside the pipeline
+    config.sample.train_batch_size = 1
+    # total images per prompt at sampling time (logical grouping)
+    config.sample.num_image_per_prompt = 8
+    # how many images to actually generate in the short window (repetition inside pipeline)
+    config.sample.mini_num_image_per_prompt = 4
+    # compute num_batches_per_epoch consistent with other fast configs
+    config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.mini_num_image_per_prompt/config.sample.num_image_per_prompt))
+    config.sample.test_batch_size = 4
+
+    # training shapes: train.batch_size equals number of repeated images per device
+    config.train.batch_size = config.sample.mini_num_image_per_prompt
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2 if config.sample.num_batches_per_epoch>0 else 1
+    config.train.num_inner_epochs = 1
+    config.train.timestep_fraction = 0.99
+
+    # kl / loss / learning rate defaults
+    config.train.beta = 0.0
+    config.train.clip_range = 1e-5
+    config.train.learning_rate = 1e-4
+    config.sample.global_std = True
+    config.sample.noise_level = 0.8
+    config.train.ema = True
+
+    config.save_freq = 60 # epoch
+    config.eval_freq = 60
+    config.save_dir = 'logs/ocr/sd3.5-M-fast-1gpu'
+    config.reward_fn = {
+        "ocr": 1.0,
+    }
+    config.prompt_fn = "general_ocr"
+    config.per_prompt_stat_tracking = True
+
+    # Note: DistributedKRepeatSampler requires total_samples % k == 0. Ensure config.sample.num_batches_per_epoch
+    # and related values produce compatible numbers for your launcher (this assert appears in the sampler implementation).
+    return config
+ 
+def general_ocr_sd3_5_pnt_1gpu_max_fast():
+    config = general_ocr_sd3_fast_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/checkpoint/sd3/model.safetensors")
+    config.use_vit_predictor=False # Whether to use ViT-based time predictor
+    return config
+
+def general_ocr_sd3_5_pnt_1gpu_maxE_fast():
+    config = general_ocr_sd3_fast_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-maxe'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/checkpoint/sd3/model.safetensors")
+    config.use_vit_predictor=False # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 4
+    return config
+
+def general_ocr_sd3_5_pnt_1gpu_vit_fast():
+    config = general_ocr_sd3_fast_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = None
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 4
+
+    return config
+
 def get_config(name):
     return globals()[name]()

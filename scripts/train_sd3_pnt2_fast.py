@@ -913,10 +913,13 @@ def main(_):
         test_dataset = TextPromptDataset(config.dataset, 'test')
 
         # Create an infinite-loop DataLoader
+        # For fast mode we repeat mini images inside the pipeline; sampler should operate on
+        # the effective train batch size (config.train.batch_size) and pick k as the
+        # number of unique samples per batch: num_image_per_prompt // mini_num_image_per_prompt
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.sample.train_batch_size,
-            k=config.sample.num_image_per_prompt,
+            batch_size=config.train.batch_size,
+            k=config.sample.num_image_per_prompt // max(1, config.sample.mini_num_image_per_prompt),
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -946,8 +949,8 @@ def main(_):
 
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.sample.train_batch_size,
-            k=config.sample.num_image_per_prompt,
+            batch_size=config.train.batch_size,
+            k=config.sample.num_image_per_prompt // max(1, config.sample.mini_num_image_per_prompt),
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42

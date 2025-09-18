@@ -86,13 +86,10 @@ def pipeline_with_logprob(
         negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
         device=device,
         clip_skip=self.clip_skip,
-        num_images_per_prompt=num_images_per_prompt,
+        num_images_per_prompt=1,
         max_sequence_length=max_sequence_length,
         lora_scale=lora_scale,
     )
-    if self.do_classifier_free_guidance:
-        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-        pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
 
     # 4. Prepare latent variables
     num_channels_latents = self.transformer.config.in_channels
