@@ -984,8 +984,8 @@ def general_ocr_sd3_fast_1gpu():
  
 def general_ocr_sd3_5_pnt_1gpu_max_fast():
     config = general_ocr_sd3_fast_1gpu()
-    config.sample.num_steps = 10
-    config.sample.eval_num_steps = 10
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'

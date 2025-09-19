@@ -1660,7 +1660,7 @@ def main(_):
                         # Add time predictor KL regularization (always active when training time predictor)
                         # Configuration: Set config.train.time_predictor_kl_weight = 0.01 (or desired value) 
                         # to control the strength of time predictor KL regularization
-                        time_predictor_kl_weight = getattr(config.train, 'time_predictor_kl_weight', 0.01)  # Default weight
+                        time_predictor_kl_weight = getattr(config.train, 'time_predictor_kl_weight', 0.0)  # Default weight
                         if time_predictor_kl_weight > 0:
                             time_predictor_kl_sample_losses = time_predictor_kl_div * active_mask_float
                             time_predictor_kl_loss = torch.mean(time_predictor_kl_sample_losses / num_train_steps)
