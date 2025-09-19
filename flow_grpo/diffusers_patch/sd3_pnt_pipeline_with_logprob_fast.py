@@ -272,6 +272,8 @@ def pipeline_with_logprob(
             all_sigmas_per_step.append(sigma.clone())
             # store active mask for this step so training can ignore inactive samples
             all_active_masks.append(active_mask.clone())
+        elif step == random_timestep + train_num_steps:
+            all_sigmas_per_step.append(sigma.clone())
             
         sigma = sigma_next
 
@@ -293,6 +295,10 @@ def pipeline_with_logprob(
         all_hidden_states_combineds = torch.empty(0)
         all_tembs = torch.empty(0)
 
+    # Provide sigma_max repeated to mini_num_image_per_prompt
+    base_sigma_max = self.scheduler.sigmas[1].clone() if len(self.scheduler.sigmas) > 1 else sigma.clone()
+    sigma_max = base_sigma_max.repeat(mini_num_image_per_prompt) if base_sigma_max.dim() == 0 or len(base_sigma_max) == 1 else base_sigma_max
+
     # Stack/return active masks aligned with all_latents/all_sigmas_per_step
     if all_active_masks:
         all_active_masks = torch.stack(all_active_masks, dim=1)
@@ -305,6 +311,7 @@ def pipeline_with_logprob(
         all_log_probs,
         all_time_predictor_log_probs,
         all_timesteps,
+        sigma_max,
         all_sigmas_per_step,
         all_hidden_states_combineds,
         all_tembs,

@@ -206,24 +206,21 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     # Create the scheduler state that sde_step_with_logprob expects
     pipeline.scheduler.index_for_timestep = [{} for _ in range(current_batch_size)]
     
+    n = 2
     # Set up the mapping for the current timestep
     for batch_idx in range(current_batch_size):
         timestep_val = current_timesteps[batch_idx].item()
-        pipeline.scheduler.index_for_timestep[batch_idx][timestep_val] = j
+        pipeline.scheduler.index_for_timestep[batch_idx][timestep_val] = n
     
     # Set up sigmas list where sigmas[step][batch_idx] gives the sigma value
     # We need at least steps j and j+1, plus sigma[1] for sigma_max
-    max_step = max(j + 1, 1)
+    max_step = max(n + 1, 1)
     pipeline.scheduler.sigmas = [torch.zeros(current_batch_size, device=device) for _ in range(max_step + 1)]
-    pipeline.scheduler.sigmas[j] = current_sigmas
-    pipeline.scheduler.sigmas[j + 1] = next_sigmas
+    pipeline.scheduler.sigmas[n] = current_sigmas
+    pipeline.scheduler.sigmas[n + 1] = next_sigmas
     
-    # Extract sigma_max from the sample's sigmas - use step 1 sigmas as sigma_max
-    if sample["sigmas"].shape[1] > 1:
-        sigma_max = sample["sigmas"][:, 1].to(device)  # Use second timestep sigmas as sigma_max
-    else:
-        sigma_max = torch.ones_like(current_sigmas)
-    pipeline.scheduler.sigmas[1] = sigma_max
+    # Extract sigma_max: prefer sample['sigma_max'] if pipeline provided it (fast pipeline now returns it)
+    pipeline.scheduler.sigmas[1] = sample["sigma_max"].to(device)
     
     # Debug: Check transformer inputs for NaN/Inf
     if torch.isnan(sample["latents"][:, j]).any() or torch.isinf(sample["latents"][:, j]).any():
@@ -582,7 +579,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _, _, _, _, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _, _, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -1136,7 +1133,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, time_predictor_log_probs, timesteps, all_sigmas_per_step, hidden_states_combineds, tembs, all_active_masks = pipeline_with_logprob(
+                    images, latents, log_probs, time_predictor_log_probs, timesteps, sigma_max, all_sigmas_per_step, hidden_states_combineds, tembs, all_active_masks = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -1178,9 +1175,9 @@ def main(_):
 
             samples.append(
                 {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
-                    "pooled_prompt_embeds": pooled_prompt_embeds,
+                    "prompt_ids": prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1),
+                    "prompt_embeds": prompt_embeds.repeat(config.sample.mini_num_image_per_prompt,1,1),
+                    "pooled_prompt_embeds": pooled_prompt_embeds.repeat(config.sample.mini_num_image_per_prompt,1),
                     "timesteps": timesteps,
                     "latents": latents,  # Store full latents tensor (no slicing to save memory)
                     # Note: next_latents removed - will use latents[:, j+1] when needed
@@ -1190,6 +1187,7 @@ def main(_):
                     "tembs": tembs,
                     "rewards": rewards,
                     "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
+                    "sigma_max": sigma_max,
                     "active_masks": all_active_masks,
                 }
             )
@@ -1521,15 +1519,9 @@ def main(_):
                 else:
                     embeds = sample["prompt_embeds"]
                     pooled_embeds = sample["pooled_prompt_embeds"]
-
-                # Get actual number of timesteps from the sample data
-                # latents has shape (batch_size, num_steps + 1), but training runs for num_steps
-                actual_num_timesteps = sample["latents"].shape[1] - 1  # Subtract 1 since latents has num_steps + 1
-                timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
-                train_timesteps = [step_index for step_index in range(actual_num_timesteps)]
                 
                 for j in tqdm(
-                    train_timesteps,
+                    range(config.sample.train_num_steps),
                     desc="Timestep",
                     position=1,
                     leave=False,
