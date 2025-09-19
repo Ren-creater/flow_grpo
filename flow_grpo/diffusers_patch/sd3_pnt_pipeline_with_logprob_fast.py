@@ -119,6 +119,7 @@ def pipeline_with_logprob(
     all_hidden_states_combineds = []
     all_tembs = []
     all_sigmas_per_step = []
+    all_active_masks = []
     
     # Clear and initialize scheduler for batched timesteps/sigmas
     self.scheduler.timesteps = []
@@ -149,7 +150,14 @@ def pipeline_with_logprob(
                 tem_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
                 tem_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
             # Update sigma to match new batch size
-            sigma = sigma.repeat(mini_num_image_per_prompt)
+                sigma = sigma.repeat(mini_num_image_per_prompt)
+                # Also repeat active_mask when repeating latents
+                if 'active_mask' in locals():
+                    active_mask = active_mask.repeat(mini_num_image_per_prompt)
+                else:
+                    active_mask = torch.ones_like(sigma, dtype=torch.bool)
+            # Update scheduler sigmas to repeat previous sigmas
+            self.scheduler.sigmas = [s.repeat(mini_num_image_per_prompt) for s in self.scheduler.sigmas]
             # Update scheduler for new batch size
             self.scheduler.index_for_timestep = [{} for _ in range(len(latents))]
             all_latents.append(latents)
@@ -227,8 +235,14 @@ def pipeline_with_logprob(
             # Check if this sample should stop
             if sigma[i] < self.min_sigma or sigma_next[i] < self.min_sigma:
                 sigma_next[i] = torch.tensor(0.0).to(sigma_next.device)
+                # Mark as inactive for next steps
+                if 'active_mask' in locals():
+                    active_mask[i] = False
+                else:
+                    active_mask = torch.ones_like(sigma, dtype=torch.bool)
+                    active_mask[i] = False
 
-        # Update scheduler state for this timestep
+    # Update scheduler state for this timestep
         self.scheduler.timesteps.append(timestep.clone())
         self.scheduler.sigmas.append(sigma_next.clone())
         # Update each batch element's index_for_timestep dictionary
@@ -237,13 +251,16 @@ def pipeline_with_logprob(
 
         latents_dtype = latents.dtype
 
-        # Apply SDE step to all samples
+        # Apply SDE step to all samples, passing active_mask for safety
+        if 'active_mask' not in locals():
+            active_mask = torch.ones(len(latents), dtype=torch.bool, device=latents.device)
         latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
             self.scheduler, 
             noise_pred.float(), 
             timestep,
             latents.float(),
             noise_level=cur_noise_level,
+            active_mask=active_mask,
         )
         
         # Store results only for training window
@@ -251,8 +268,10 @@ def pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
             all_time_predictor_log_probs.append(step_time_predictor_log_probs)
-            all_timesteps.append(timestep.repeat(len(latents)))
+            all_timesteps.append(timestep)
             all_sigmas_per_step.append(sigma.clone())
+            # store active mask for this step so training can ignore inactive samples
+            all_active_masks.append(active_mask.clone())
             
         sigma = sigma_next
 
@@ -274,4 +293,20 @@ def pipeline_with_logprob(
         all_hidden_states_combineds = torch.empty(0)
         all_tembs = torch.empty(0)
 
-    return image, all_latents, all_log_probs, all_time_predictor_log_probs, all_timesteps, all_sigmas_per_step, all_hidden_states_combineds, all_tembs
+    # Stack/return active masks aligned with all_latents/all_sigmas_per_step
+    if all_active_masks:
+        all_active_masks = torch.stack(all_active_masks, dim=1)
+    else:
+        all_active_masks = torch.empty(0)
+
+    return (
+        image,
+        all_latents,
+        all_log_probs,
+        all_time_predictor_log_probs,
+        all_timesteps,
+        all_sigmas_per_step,
+        all_hidden_states_combineds,
+        all_tembs,
+        all_active_masks,
+    )

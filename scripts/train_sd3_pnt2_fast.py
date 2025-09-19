@@ -190,7 +190,7 @@ def create_generator(prompts, base_seed):
     return generators
 
         
-def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config):
+def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask=None):
     # Set up scheduler state for sde_step_with_logprob
     current_batch_size = sample["latents"].shape[0]
     current_timesteps = sample["timesteps"][:, j]  # timesteps for step j across current batch
@@ -275,6 +275,12 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     if torch.isnan(next_latents).any() or torch.isinf(next_latents).any():
         logger.warning(f"NaN/Inf detected in next_latents at timestep {j}: {next_latents.isnan().sum()} NaNs, {next_latents.isinf().sum()} Infs")
     
+    # Ensure per-step active mask is available and on device
+    if per_step_active_mask is None:
+        per_step_active_mask = torch.ones(current_batch_size, dtype=torch.bool, device=device)
+    else:
+        per_step_active_mask = per_step_active_mask.to(device)
+
     # compute the log prob of next_latents given latents under the current model
     prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
         pipeline.scheduler,
@@ -283,6 +289,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
         current_latents,
         prev_sample=next_latents,
         noise_level=config.sample.noise_level,
+        active_mask=per_step_active_mask,
     )
     
     # Debug: Check outputs from sde_step_with_logprob for NaN/Inf
@@ -306,7 +313,7 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config):
+def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask=None):
     """
     Compute the log probability of the time predictor for step j.
     This function uses the saved hidden states and temporal embeddings to recompute
@@ -357,12 +364,18 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         if torch.isnan(param2).any() or torch.isinf(param2).any():
             logger.warning(f"NaN/Inf detected in time_predictor param2 for sample {i}: {param2}")
     
+    # Prepare per-step active mask
+    if per_step_active_mask is None:
+        per_step_active_mask = torch.ones(current_batch_size, dtype=torch.bool, device=device)
+    else:
+        per_step_active_mask = per_step_active_mask.to(device)
+
     # Build list of log probabilities and construct final tensor from gradient-enabled tensors
     log_probs_list = []
     
     for i, (param1, param2) in enumerate(time_preds):
-        # Skip log prob computation if sigma is below threshold (following modeling_sd3_pnt.py pattern)
-        if current_sigmas[i] < pipeline.min_sigma:
+        # Skip log prob computation if sample is inactive or sigma is below threshold
+        if (not per_step_active_mask[i]) or (current_sigmas[i] < pipeline.min_sigma):
             # Use a zero tensor that maintains gradients from time_preds
             zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
             log_probs_list.append(zero_logprob)
@@ -569,7 +582,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _, _, _, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -582,7 +595,6 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     height=config.resolution,
                     width=config.resolution, 
                     noise_level=0,
-                    train_num_steps=1,
                     process_index=accelerator.process_index,
                     sample_num_steps=config.sample.eval_num_steps,
                 )
@@ -918,8 +930,8 @@ def main(_):
         # number of unique samples per batch: num_image_per_prompt // mini_num_image_per_prompt
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.train.batch_size,
-            k=config.sample.num_image_per_prompt // max(1, config.sample.mini_num_image_per_prompt),
+            batch_size=config.sample.train_batch_size,
+            k=config.sample.num_image_per_prompt // config.sample.mini_num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -949,8 +961,8 @@ def main(_):
 
         train_sampler = DistributedKRepeatSampler( 
             dataset=train_dataset,
-            batch_size=config.train.batch_size,
-            k=config.sample.num_image_per_prompt // max(1, config.sample.mini_num_image_per_prompt),
+            batch_size=config.sample.train_batch_size,
+            k=config.sample.num_image_per_prompt // config.sample.mini_num_image_per_prompt,
             num_replicas=accelerator.num_processes,
             rank=accelerator.process_index,
             seed=42
@@ -1124,7 +1136,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, time_predictor_log_probs, timesteps, all_sigmas_per_step, hidden_states_combineds, tembs = pipeline_with_logprob(
+                    images, latents, log_probs, time_predictor_log_probs, timesteps, all_sigmas_per_step, hidden_states_combineds, tembs, all_active_masks = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -1153,8 +1165,11 @@ def main(_):
             # all_sigmas_per_step contains sigma values for each step, we need to stack them
             sigmas = torch.stack(all_sigmas_per_step, dim=1)  # (batch_size, num_steps + 1)
 
-            # Stack timesteps - this should work if scheduler.timesteps has consistent shapes
-            timesteps = torch.stack(pipeline.scheduler.timesteps, dim=1)
+            timesteps = torch.stack(timesteps, dim=1)
+            # compute rewards asynchronously
+            prompts = pipeline.tokenizer.batch_decode(
+                prompt_ids.repeat(config.sample.mini_num_image_per_prompt,1), skip_special_tokens=True
+            )
 
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
@@ -1175,6 +1190,7 @@ def main(_):
                     "tembs": tembs,
                     "rewards": rewards,
                     "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
+                    "active_masks": all_active_masks,
                 }
             )
 
@@ -1522,13 +1538,23 @@ def main(_):
                     with accelerator.accumulate(transformer):
                         with autocast():
                             
+                            # extract per-step active mask if available
+                            if "active_masks" in sample and sample["active_masks"].numel() != 0:
+                                per_step_active_mask = sample["active_masks"][:, j].to(accelerator.device)
+                            else:
+                                per_step_active_mask = torch.ones(sample["latents"].shape[0], dtype=torch.bool, device=accelerator.device)
+
                             if not is_time_predictor_only_phase:
                                 # Full joint training: compute both diffusion and time predictor logprobs
-                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask)
+                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(
+                                    transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                                )
                                 if config.train.beta > 0:
                                     with torch.no_grad():
                                         with transformer.module.disable_adapter():
-                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask)
+                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(
+                                                transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                                            )
                             else:
                                 # Time predictor only: skip diffusion logprob computation for efficiency
                                 diffusion_log_prob = torch.zeros_like(sample["log_probs"][:, j])
@@ -1537,7 +1563,9 @@ def main(_):
                                 prev_sample_mean_ref = None
                             
                             # Always compute time predictor logprobs (this is what we're training)
-                            time_predictor_log_prob = compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config)
+                            time_predictor_log_prob = compute_time_predictor_log_prob(
+                                pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                            )
                             
                             # Check for NaN/Inf in individual components before combining
                             if not is_time_predictor_only_phase:
@@ -1552,9 +1580,9 @@ def main(_):
                             # Compute time predictor KL divergence for regularization
                             time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
 
-                        # Create mask for active samples at this timestep (remove duplicate)
-                        # active_mask already created above as boolean, convert to float for calculations
-                        active_mask_float = active_mask.float()  # Shape: (batch_size,)
+                        # Create mask for active samples at this timestep (use per_step_active_mask)
+                        # per_step_active_mask is a boolean tensor, convert to float for calculations
+                        active_mask_float = per_step_active_mask.float()  # Shape: (batch_size,)
                         
                         # Combine logprobs: diffusion logprobs + time predictor logprobs
                         if is_time_predictor_only_phase:

@@ -948,12 +948,12 @@ def general_ocr_sd3_fast_1gpu():
     # for fast mode we sample 1 prompt per device and expand mini images inside the pipeline
     config.sample.train_batch_size = 1
     # total images per prompt at sampling time (logical grouping)
-    config.sample.num_image_per_prompt = 8
+    config.sample.num_image_per_prompt = 4
     # how many images to actually generate in the short window (repetition inside pipeline)
     config.sample.mini_num_image_per_prompt = 4
     # compute num_batches_per_epoch consistent with other fast configs
     config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.mini_num_image_per_prompt/config.sample.num_image_per_prompt))
-    config.sample.test_batch_size = 4
+    config.sample.test_batch_size = 16
 
     # training shapes: train.batch_size equals number of repeated images per device
     config.train.batch_size = config.sample.mini_num_image_per_prompt
@@ -984,8 +984,8 @@ def general_ocr_sd3_fast_1gpu():
  
 def general_ocr_sd3_5_pnt_1gpu_max_fast():
     config = general_ocr_sd3_fast_1gpu()
-    config.sample.num_steps = 50
-    config.sample.eval_num_steps = 50
+    config.sample.num_steps = 10
+    config.sample.eval_num_steps = 10
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
