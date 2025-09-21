@@ -522,6 +522,8 @@ def counting_flux_kontext():
     config.per_prompt_stat_tracking = True
     return config
 
+######################################################
+
 def pickscore_sd3_pnt_4gpu():
     config = pickscore_sd3_4gpu()
     # sd3 medium (not 3.5) - local path
@@ -563,7 +565,7 @@ def general_ocr_sd3_5_pnt_1gpu():
     
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_big():
+def general_ocr_sd3_5_pnt_big_1gpu():
     config = general_ocr_sd3_1gpu()
     config.sample.num_steps = 40
     config.sample.eval_num_steps = 40
@@ -578,7 +580,7 @@ def general_ocr_sd3_5_pnt_1gpu_big():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_maxE():
+def general_ocr_sd3_5_pnt_maxE_1gpu():
     config = general_ocr_sd3_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -594,7 +596,7 @@ def general_ocr_sd3_5_pnt_1gpu_maxE():
     config.train.time_predictor_only_epochs = 2
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_max():
+def general_ocr_sd3_5_pnt_max_1gpu():
     config = general_ocr_sd3_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -609,7 +611,7 @@ def general_ocr_sd3_5_pnt_1gpu_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_vit():
+def general_ocr_sd3_5_pnt_vit_1gpu():
     config = general_ocr_sd3_1gpu()
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
@@ -624,6 +626,7 @@ def general_ocr_sd3_5_pnt_1gpu_vit():
 
     return config
 
+##########################################
 
 def general_ocr_sd3_pnt():
     config = general_ocr_sd3()
@@ -684,6 +687,8 @@ def general_ocr_sd3_5_pnt_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     
     return config
+
+###########################################
 
 def geneval_sd3_pnt():
     gpu_number = 32
@@ -761,6 +766,94 @@ def pickscore_sd3_pnt():
     config.per_prompt_stat_tracking = True
     return config
 
+###################### 1 GPU #################
+
+################ Pickscore #############
+def pickscore_sd3_1gpu():
+    gpu_number = 1
+    config = compressibility()
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+
+    # sd3.5 medium
+    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.sample.num_steps = 10
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 4.5
+
+    config.resolution = 512
+    config.sample.train_batch_size = 8
+    config.sample.num_image_per_prompt = 8
+    config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
+    config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
+    config.train.num_inner_epochs = 1
+    config.train.timestep_fraction = 0.99
+    config.train.beta = 0.01
+    config.sample.global_std = True
+    config.sample.same_latent = False
+    config.train.ema = True
+    config.save_freq = 60 # epoch
+    config.eval_freq = 60
+    config.save_dir = 'logs/pickscore/sd3.5-M'
+    config.reward_fn = {
+        "pickscore": 1.0,
+    }
+    
+    config.prompt_fn = "general_ocr"
+
+    config.per_prompt_stat_tracking = True
+    return config
+
+def pickscore_sd3_5_pnt_max_1gpu():
+    config = pickscore_sd3_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-max'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/checkpoint/sd3/model.safetensors")
+    config.use_vit_predictor=False # Whether to use ViT-based time predictor
+    return config
+
+def pickscore_sd3_5_pnt_maxE_1gpu():
+    config = pickscore_sd3_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-maxe'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/checkpoint/sd3/model.safetensors")
+    config.use_vit_predictor=False # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 4
+    return config
+
+def pickscore_sd3_5_pnt_vit_1gpu():
+    config = pickscore_sd3_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    # Alternative checkpoint path if needed
+    config.sd3_checkpoint_path = None
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 61
+
+    return config
 
 ############# 8 GPUS #############
 ########### OCR ############
@@ -795,7 +888,7 @@ def general_ocr_sd3_8gpu():
 
     return config
 
-def general_ocr_sd3_5_pnt_max():
+def general_ocr_sd3_5_pnt_max_8gpu():
     config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -810,7 +903,7 @@ def general_ocr_sd3_5_pnt_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def general_ocr_sd3_5_pnt_maxE():
+def general_ocr_sd3_5_pnt_maxE_8gpu():
     config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -826,7 +919,7 @@ def general_ocr_sd3_5_pnt_maxE():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def general_ocr_sd3_5_pnt_vit():
+def general_ocr_sd3_5_pnt_vit_8gpu():
     config = general_ocr_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -882,7 +975,7 @@ def pickscore_sd3_8gpu():
     config.per_prompt_stat_tracking = True
     return config
 
-def pickscore_sd3_5_pnt_max():
+def pickscore_sd3_5_pnt_max_8gpu():
     config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -897,7 +990,7 @@ def pickscore_sd3_5_pnt_max():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def pickscore_sd3_5_pnt_maxE():
+def pickscore_sd3_5_pnt_maxE_8gpu():
     config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -913,7 +1006,7 @@ def pickscore_sd3_5_pnt_maxE():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def pickscore_sd3_5_pnt_vit():
+def pickscore_sd3_5_pnt_vit_8gpu():
     config = pickscore_sd3_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -983,7 +1076,7 @@ def general_ocr_sd3_fast_1gpu():
     # and related values produce compatible numbers for your launcher (this assert appears in the sampler implementation).
     return config
  
-def general_ocr_sd3_5_pnt_1gpu_max_fast():
+def general_ocr_sd3_5_pnt_max_fast_1gpu():
     config = general_ocr_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -998,7 +1091,7 @@ def general_ocr_sd3_5_pnt_1gpu_max_fast():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_maxE_fast():
+def general_ocr_sd3_5_pnt_maxE_fast_1gpu():
     config = general_ocr_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -1014,7 +1107,7 @@ def general_ocr_sd3_5_pnt_1gpu_maxE_fast():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_vit_fast():
+def general_ocr_sd3_5_pnt_vit_fast_1gpu():
     config = general_ocr_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -1075,7 +1168,7 @@ def pickscore_sd3_fast_1gpu():
     config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-PickScore")
     return config
 
-def pickscore_sd3_5_pnt_max_fast():
+def pickscore_sd3_5_pnt_max_fast_1gpu():
     config = pickscore_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -1090,7 +1183,7 @@ def pickscore_sd3_5_pnt_max_fast():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def pickscore_sd3_5_pnt_maxE():
+def pickscore_sd3_5_pnt_maxE_fast_1gpu():
     config = pickscore_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -1106,7 +1199,7 @@ def pickscore_sd3_5_pnt_maxE():
     config.train.time_predictor_only_epochs = 60
     return config
 
-def pickscore_sd3_5_pnt_vit():
+def pickscore_sd3_5_pnt_vit_fast_1gpu():
     config = pickscore_sd3_fast_1gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
@@ -1125,13 +1218,15 @@ def pickscore_sd3_5_pnt_vit():
 
 ################## FAST OCR 8 GPU ##################
 
+root = "/models"
+
 def general_ocr_sd3_fast_8gpu():
     gpu_number = 8
     config = compressibility()
     config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
 
     # sd3.5 medium
-    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.pretrained.model = os.path.expanduser(f"{root}/stable-diffusion-3.5-medium")
     config.sample.num_steps = 10
     config.sample.train_num_steps = 4
     config.sample.eval_num_steps = 40
@@ -1170,7 +1265,7 @@ def general_ocr_sd3_fast_8gpu():
     }
     config.prompt_fn = "general_ocr"
     config.per_prompt_stat_tracking = True
-    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-Text")
+    config.train.lora_path = os.path.expanduser(f"{root}/SD3.5M-FlowGRPO-Text")
 
     # Note: DistributedKRepeatSampler requires total_samples % k == 0. Ensure config.sample.num_batches_per_epoch
     # and related values produce compatible numbers for your launcher (this assert appears in the sampler implementation).
@@ -1180,8 +1275,6 @@ def general_ocr_sd3_5_pnt_max_fast_8gpu():
     config = general_ocr_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
-    # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
@@ -1195,8 +1288,6 @@ def general_ocr_sd3_5_pnt_maxE_fast_8gpu():
     config = general_ocr_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
-    # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
@@ -1211,8 +1302,6 @@ def general_ocr_sd3_5_pnt_1gpu_vit_fast_8gpu():
     config = general_ocr_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
-    # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming
@@ -1232,7 +1321,8 @@ def pickscore_sd3_fast_8gpu():
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 
     # sd3.5 medium
-    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    #config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.pretrained.model = os.path.expanduser(f"{root}/stable-diffusion-3.5-medium")
     config.sample.num_steps = 10
     config.sample.train_num_steps = 4
     config.sample.eval_num_steps = 40
@@ -1265,7 +1355,7 @@ def pickscore_sd3_fast_8gpu():
     config.prompt_fn = "general_ocr"
 
     config.per_prompt_stat_tracking = True
-    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-PickScore")
+    config.train.lora_path = os.path.expanduser(f"{root}/SD3.5M-FlowGRPO-PickScore")
     return config
 
 def pickscore_sd3_5_pnt_max_fast_8gpu():
@@ -1273,7 +1363,6 @@ def pickscore_sd3_5_pnt_max_fast_8gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-max'
 
     # Add time predictor checkpoint path for resuming
@@ -1283,12 +1372,11 @@ def pickscore_sd3_5_pnt_max_fast_8gpu():
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
     return config
 
-def pickscore_sd3_5_pnt_maxE_8gpu():
+def pickscore_sd3_5_pnt_maxE_fast_8gpu():
     config = pickscore_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-maxe'
 
     # Add time predictor checkpoint path for resuming
@@ -1299,12 +1387,11 @@ def pickscore_sd3_5_pnt_maxE_8gpu():
     config.train.time_predictor_only_epochs = 60
     return config
 
-def pickscore_sd3_5_pnt_vit_8gpu():
+def pickscore_sd3_5_pnt_vit_fast_8gpu():
     config = pickscore_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
 
     # Add time predictor checkpoint path for resuming

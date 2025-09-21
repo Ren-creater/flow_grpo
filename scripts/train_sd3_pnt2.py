@@ -349,8 +349,11 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
         logger.warning(f"NaN/Inf detected in temb at timestep {j}: {temb.isnan().sum()} NaNs, {temb.isinf().sum()} Infs")
     
     # Call the time predictor to get alpha and beta
-    time_preds = pipeline.time_predictor(hidden_states_combined, temb)
-    
+    if pipeline.use_vit_predictor:
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb, embeds)
+    else:
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+
     # Check time_preds for NaN before processing
     for i, (param1, param2) in enumerate(time_preds):
         if torch.isnan(param1).any() or torch.isinf(param1).any():
@@ -472,7 +475,10 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
         temb = temb.to(dtype=torch.float32)
     
     # Call the time predictor to get alpha and beta
-    time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+    if pipeline.use_vit_predictor:
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb, embeds)
+    else:
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb)
     
     # Build list of KL divergences and construct final tensor from gradient-enabled tensors
     kl_divs_list = []

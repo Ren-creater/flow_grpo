@@ -309,15 +309,18 @@ class ViTTimePredictor(nn.Module):
         # Class token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         
-        # Text projection (if using text conditioning)
-        if config.use_text_conditioning:
-            self.text_proj = nn.Linear(config.text_embed_dim, config.hidden_size)
-            self.text_norm = nn.LayerNorm(config.hidden_size)
-        
         # Timestep projection (if using timestep conditioning)
         if config.use_timestep_conditioning:
             self.timestep_proj = nn.Linear(config.timestep_embed_dim, config.hidden_size)
             self.timestep_norm = nn.LayerNorm(config.hidden_size)
+        
+        # Text projection (project external text embeddings to hidden_size)
+        # Some pipelines provide text embeddings with a feature dim different from
+        # the ViT `hidden_size` (e.g. concatenated CLIP+T5 features). Create a
+        # small projection to map them into the transformer's internal feature
+        # size so cross-attention Linear layers receive the expected shape.
+        if config.use_text_conditioning:
+            self.text_proj = nn.Linear(config.text_embed_dim, config.hidden_size)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -388,19 +391,22 @@ class ViTTimePredictor(nn.Module):
         x = x + self.pos_embed
         x = self.dropout(x)
         
-        # Process text embeddings if provided
-        text_context = None
-        if self.config.use_text_conditioning and text_embeds is not None:
-            # Project text embeddings to hidden size
-            text_context = self.text_proj(text_embeds)  # (B, seq_len, hidden_size)
-            text_context = self.text_norm(text_context)
+        # Process text embeddings if provided and project to hidden_size
+        text_context = text_embeds
+        if text_context is not None and hasattr(self, "text_proj"):
+            # text_embeds: (B, seq_len, text_embed_dim) -> (B, seq_len, hidden_size)
+            text_context = self.text_proj(text_context)
         
-        # Process timestep embeddings if provided
+        # Do not pre-project timestep embeddings here.
+        # TransformerBlock already contains its own `timestep_proj` which expects the
+        # original timestep embedding size (config.timestep_embed_dim). Passing a
+        # pre-projected tensor caused a double projection and dimension mismatch
+        # when TransformerBlock attempted to project again.
         processed_timestep_embed = None
         if self.config.use_timestep_conditioning and timestep_embed is not None:
-            # Project timestep embeddings to hidden size
-            processed_timestep_embed = self.timestep_proj(timestep_embed)  # (B, hidden_size)
-            processed_timestep_embed = self.timestep_norm(processed_timestep_embed)
+            # Forward the raw timestep embedding (B, timestep_embed_dim) to blocks.
+            # Each block will apply its own projection to `hidden_size`.
+            processed_timestep_embed = timestep_embed
         
         # Pass through transformer blocks
         for block in self.blocks:
@@ -439,7 +445,7 @@ class HybridTimePredictor(nn.Module):
                 init_beta=config.init_beta
             )
     
-    def forward(self, hidden_states_combined, text_embeds=None, timestep_embed=None, attention_mask=None):
+    def forward(self, hidden_states_combined, timestep_embed=None, text_embeds=None, attention_mask=None):
         if self.use_vit:
             return self.predictor(hidden_states_combined, text_embeds, timestep_embed, attention_mask)
         else:
@@ -472,9 +478,15 @@ def init_time_predictor(
     # Initialize TimePredictor (CNN or ViT based)
     if use_vit_predictor:
         if time_predictor_config is None:
+            # The transformer concatenates multiple text feature sources; the
+            # effective text embedding feature dimension can be twice the
+            # `caption_projection_dim` (e.g. 4096). Make sure the
+            # TimePredictorConfig.text_embed_dim matches that size so the
+            # linear `text_proj` in `ViTTimePredictor` accepts the incoming
+            # tensors without a matmul shape mismatch.
             time_predictor_config = TimePredictorConfig(
                 in_channels=self.transformer.config.caption_projection_dim * 2,
-                text_embed_dim=self.transformer.config.caption_projection_dim,
+                text_embed_dim=4096,
                 init_alpha=init_alpha,
                 init_beta=init_beta,
             )
@@ -546,9 +558,11 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
         # Initialize TimePredictor (CNN or ViT based)
         if use_vit_predictor:
             if time_predictor_config is None:
+                # Match the combined text embedding size produced by the
+                # transformer (concatenated CLIP+T5 or multiple CLIP encoders).
                 time_predictor_config = TimePredictorConfig(
                     in_channels=self.transformer.config.caption_projection_dim * 2,
-                    text_embed_dim=self.transformer.config.caption_projection_dim,
+                    text_embed_dim=4096,
                     init_alpha=init_alpha,
                     init_beta=init_beta,
                 )

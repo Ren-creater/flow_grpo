@@ -207,7 +207,10 @@ def pipeline_with_logprob(
             all_tembs.append(temb.half().cpu())
 
         # Predict next sigma using time predictor and collect logprobs
-        time_preds = self.time_predictor(hidden_states_combined, temb)
+        if self.use_vit_predictor:
+            time_preds = self.time_predictor(hidden_states_combined, temb, prompt_embeds)
+        else:
+            time_preds = self.time_predictor(hidden_states_combined, temb)
         current_batch_size = len(latents)
         sigma_next = torch.zeros_like(sigma)
         step_time_predictor_log_probs = torch.zeros_like(sigma)
