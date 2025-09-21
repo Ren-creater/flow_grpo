@@ -593,7 +593,7 @@ def general_ocr_sd3_5_pnt_maxE_1gpu():
     # Alternative checkpoint path if needed
     config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/checkpoint/sd3/model.safetensors")
     config.use_vit_predictor=False # Whether to use ViT-based time predictor
-    config.train.time_predictor_only_epochs = 2
+    config.train.time_predictor_only_epochs = 4
     return config
 
 def general_ocr_sd3_5_pnt_max_1gpu():
@@ -1298,7 +1298,7 @@ def general_ocr_sd3_5_pnt_maxE_fast_8gpu():
     config.train.time_predictor_only_epochs = 4
     return config
 
-def general_ocr_sd3_5_pnt_1gpu_vit_fast_8gpu():
+def general_ocr_sd3_5_pnt_vit_fast_8gpu():
     config = general_ocr_sd3_fast_8gpu()
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50

@@ -1135,10 +1135,13 @@ def main(_):
                         generator=generator
                 )
 
-            latents = torch.stack(
-                latents, dim=1
-            )  # (batch_size, num_steps + 1, 16, 96, 96)
-            log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+            # Stack only what we need depending on training phase to save memory
+            if not is_time_predictor_only_phase:
+                latents = torch.stack(
+                    latents, dim=1
+                )  # (batch_size, num_steps + 1, 16, 96, 96)
+                log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+            # Always stack time predictor log probs (used in both phases)
             time_predictor_log_probs = torch.stack(time_predictor_log_probs, dim=1)  # shape after stack (batch_size, num_steps)
 
             # Stack sigmas to match timesteps and latents structure
@@ -1153,23 +1156,25 @@ def main(_):
             # yield to to make sure reward computation starts
             time.sleep(0)
 
-            samples.append(
-                {
-                    "prompt_ids": prompt_ids,
-                    "prompt_embeds": prompt_embeds,
-                    "pooled_prompt_embeds": pooled_prompt_embeds,
-                    "timesteps": timesteps,
-                    "timesteps_per_sample": timesteps_per_sample,
-                    "latents": latents,  # Store full latents tensor (no slicing to save memory)
-                    # Note: next_latents removed - will use latents[:, j+1] when needed
-                    "log_probs": log_probs,
-                    "time_predictor_log_probs": time_predictor_log_probs,
-                    "hidden_states_combineds": hidden_states_combineds,
-                    "tembs": tembs,
-                    "rewards": rewards,
-                    "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
-                }
-            )
+            sample_entry = {
+                "prompt_ids": prompt_ids,
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "timesteps": timesteps,
+                "timesteps_per_sample": timesteps_per_sample,
+                "time_predictor_log_probs": time_predictor_log_probs,
+                "hidden_states_combineds": hidden_states_combineds,
+                "tembs": tembs,
+                "rewards": rewards,
+                "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
+            }
+            # Only store heavy tensors when not in time_predictor-only phase
+            if not is_time_predictor_only_phase:
+                sample_entry["latents"] = latents
+                # Note: next_latents removed - will use latents[:, j+1] when needed
+                sample_entry["log_probs"] = log_probs
+
+            samples.append(sample_entry)
 
         # wait for all rewards to be computed
         for sample in tqdm(
@@ -1187,19 +1192,30 @@ def main(_):
             # Keep rewards for WandB logging - will be cleaned up later
         
         # Clean up large tensors immediately
-        del latents, log_probs, time_predictor_log_probs, sigmas, timesteps
+        # Clean up local tensors
+        try:
+            del latents
+        except Exception:
+            pass
+        try:
+            del log_probs
+        except Exception:
+            pass
+        del time_predictor_log_probs, sigmas, timesteps
         gc.collect()
 
         # Pad tensors to the same length before collation to handle variable timesteps
         # Note: latents now has shape (batch_size, num_steps + 1) 
         # while log_probs have (batch_size, num_steps)
         # sigmas has shape (batch_size, num_steps + 1) like latents
-        max_timesteps_latents = max(s["latents"].shape[1] for s in samples)  # This is num_steps + 1
-        max_timesteps_logprobs = max_timesteps_latents - 1  # This is num_steps for log_probs
+        # Derive max lengths without requiring latents in TP-only phase
+        max_timesteps_logprobs = max(s["time_predictor_log_probs"].shape[1] for s in samples)
+        max_timesteps_latents = max_timesteps_logprobs + 1
         
         for sample in samples:
-            current_timesteps_latents = sample["latents"].shape[1]
-            if current_timesteps_latents < max_timesteps_latents:
+            # In TP-only, there is no latents key; skip latents padding and only pad others
+            current_timesteps_logprobs = sample["time_predictor_log_probs"].shape[1]
+            if current_timesteps_logprobs < max_timesteps_logprobs:
                 
                 # Use more memory-efficient padding by pre-allocating full-size tensors
                 # and copying data instead of concatenating
@@ -1324,7 +1340,8 @@ def main(_):
         samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
         # Get maximum padded timesteps and actual timesteps per sample
         # latents has shape (batch_size, num_steps + 1), but rewards need to match timesteps (num_steps)
-        max_padded_timesteps_rewards = samples["latents"].shape[1] - 1  # Subtract 1 for rewards
+        # Rewards per-timestep length equals number of time steps
+        max_padded_timesteps_rewards = samples["time_predictor_log_probs"].shape[1]
         timesteps_per_sample = samples["timesteps_per_sample"]  # Actual timesteps for each sample
         
         # Apply gamma discounting like in modeling_sd3_pnt.py reward function
@@ -1501,8 +1518,8 @@ def main(_):
                     pooled_embeds = sample["pooled_prompt_embeds"]
 
                 # Get actual number of timesteps from the sample data
-                # latents has shape (batch_size, num_steps + 1), but training runs for num_steps
-                actual_num_timesteps = sample["latents"].shape[1] - 1  # Subtract 1 since latents has num_steps + 1
+                # Number of steps to train equals the TP logprobs length (or latents-1 in joint phase)
+                actual_num_timesteps = sample["time_predictor_log_probs"].shape[1]
                 timesteps_per_sample = sample["timesteps_per_sample"]  # Actual timesteps per sample
                 train_timesteps = [step_index for step_index in range(actual_num_timesteps)]
                 
@@ -1533,7 +1550,7 @@ def main(_):
                                             _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, active_mask)
                             else:
                                 # Time predictor only: skip diffusion logprob computation for efficiency
-                                diffusion_log_prob = torch.zeros_like(sample["log_probs"][:, j])
+                                diffusion_log_prob = None
                                 prev_sample_mean = None
                                 std_dev_t = None
                                 prev_sample_mean_ref = None
