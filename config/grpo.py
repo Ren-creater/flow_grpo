@@ -623,9 +623,6 @@ def general_ocr_sd3_5_pnt_vit_1gpu():
     config.sd3_checkpoint_path = None
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
     config.train.time_predictor_only_epochs = 4
-    config.time_predictor_config_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "TPDM", "configs", "models", "sd35_pnt_vit.yaml")
-    )
 
     return config
 
@@ -1124,10 +1121,7 @@ def general_ocr_sd3_5_pnt_vit_fast_1gpu():
     # Alternative checkpoint path if needed
     config.sd3_checkpoint_path = None
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
-    config.train.time_predictor_only_epochs = 4
-    config.time_predictor_config_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "TPDM", "configs", "models", "sd35_pnt_vit.yaml")
-    )
+    config.train.time_predictor_only_epochs = 1
 
     return config
 

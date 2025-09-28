@@ -8,7 +8,7 @@ time_predictor_config:
   mlp_ratio: 4.0
   dropout: 0.1
   attention_dropout: 0.1
-  image_size: 64
+  image_size: 32
   patch_size: 8
   in_channels: 3072  # Combined hidden states channels (may need adjustment for SD3.5)
   text_embed_dim: 4096  # Text embedding dimension (may need adjustment for SD3.5)

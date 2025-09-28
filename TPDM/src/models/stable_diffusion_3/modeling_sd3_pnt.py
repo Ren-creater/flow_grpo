@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import List, Optional, Union
 from dataclasses import dataclass
 from omegaconf import DictConfig
@@ -38,41 +39,54 @@ from diffusers.utils import (
     unscale_lora_layers,
 )
 
-# def reshape_hidden_states_to_2d(
-#     hidden_states: torch.Tensor,
-#     height: int = 64,
-#     width: int = 64,
-#     patch_size: int = 2,
-# ) -> torch.Tensor:
-#     """
-#     Reshape the hidden states to have a 2D spatial structure.
-#     """
-#     hidden_states = hidden_states.reshape(
-#         shape=(
-#             hidden_states.shape[0],
-#             height // patch_size,
-#             width // patch_size,
-#             patch_size,
-#             patch_size,
-#             hidden_states.shape[-1],
-#         )
-#     )
-#     hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
-#     hidden_states = hidden_states.reshape(shape=(hidden_states.shape[0], hidden_states.shape[1], height, width))
-#     return hidden_states
+def reshape_hidden_states_to_2d(
+    hidden_states: torch.Tensor,
+    height: int = 64,
+    width: int = 64,
+    patch_size: int = 2,
+) -> torch.Tensor:
+    """
+    Reshape the hidden states to have a 2D spatial structure.
+    """
+    batch_size, num_tokens, _ = hidden_states.shape
+    expected_tokens = height * width
 
-def reshape_hidden_states_to_2d(hidden_states, height=64, width=64, patch_size=2):
-    B, L, C = hidden_states.shape  # e.g. (16, 1024, 1536)
+    if expected_tokens != num_tokens:
+        spatial_dim = math.isqrt(num_tokens)
+        if spatial_dim * spatial_dim != num_tokens:
+            raise ValueError(
+                f"Cannot reshape hidden states of length {num_tokens} into a square grid."
+            )
+        height = spatial_dim
+        width = spatial_dim
+        patch_size = 1
 
-    Hpatch, Wpatch = height // patch_size, width // patch_size
-    assert L == Hpatch * Wpatch, f"Expected {Hpatch*Wpatch} tokens, got {L}"
+    hidden_states = hidden_states.reshape(
+        shape=(
+            batch_size,
+            height // patch_size,
+            width // patch_size,
+            patch_size,
+            patch_size,
+            hidden_states.shape[-1],
+        )
+    )
+    hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+    hidden_states = hidden_states.reshape(shape=(hidden_states.shape[0], hidden_states.shape[1], height, width))
+    return hidden_states
 
-    # Do NOT divide channels by patch_size**2
-    # Keep full C (1536), just expand spatially
-    x = hidden_states.reshape(B, Hpatch, Wpatch, C)
-    x = x.permute(0, 3, 1, 2).contiguous()  # (B, C, Hpatch, Wpatch)
-    x = torch.nn.functional.interpolate(x, size=(height, width), mode="nearest")
-    return x
+# def reshape_hidden_states_to_2d(hidden_states, height=64, width=64, patch_size=2):
+#     B, L, C = hidden_states.shape  # e.g. (16, 1024, 1536)
+
+#     Hpatch, Wpatch = height // patch_size, width // patch_size
+#     assert L == Hpatch * Wpatch, f"Expected {Hpatch*Wpatch} tokens, got {L}"
+
+#     # Do NOT divide channels by patch_size**2
+#     # Keep full C (1536), just expand spatially
+#     x = hidden_states.reshape(B, Hpatch, Wpatch, C)
+#     x = x.permute(0, 3, 1, 2).contiguous()  # (B, C, Hpatch, Wpatch)
+#     x = torch.nn.functional.interpolate(x, size=(height, width), mode="nearest")
+#     return x
 
 class CustomAdaGroupNormZeroSingle(nn.Module):
     r"""
@@ -159,7 +173,7 @@ class TimePredictorConfig:
     attention_dropout: float = 0.1
     
     # Input/Output parameters
-    image_size: int = 64
+    image_size: int = 32
     patch_size: int = 8
     in_channels: int = 3072  # Combined hidden states channels
     text_embed_dim: int = 1536  # Text embedding dimension
@@ -621,11 +635,7 @@ class SD3PredictNextTimeStepModel(nn.Module):
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.tokenizer_max_length = 77
-        self.default_sample_size = (
-            self.transformer.config.sample_size
-            if hasattr(self, "transformer") and self.transformer is not None
-            else 128
-        )
+        self.default_sample_size = 64
         self.patch_size = (
             self.transformer.config.patch_size if hasattr(self, "transformer") and self.transformer is not None else 2
         )

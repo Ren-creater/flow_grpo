@@ -724,11 +724,16 @@ def main(_):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
 
-    accelerator = Accelerator(
-        mixed_precision=config.mixed_precision,
-        project_config=accelerator_config,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * config.sample.train_num_steps,
+    # Ensure any prepared kwargs (e.g. DDP find_unused_parameters handler) are passed
+    # into Accelerator. We also make certain the gradient_accumulation_steps matches
+    # the intended inner training steps (uses config.sample.train_num_steps here).
+    accelerator_kwargs["mixed_precision"] = config.mixed_precision
+    accelerator_kwargs["project_config"] = accelerator_config
+    accelerator_kwargs["gradient_accumulation_steps"] = (
+        config.train.gradient_accumulation_steps * config.sample.train_num_steps
     )
+
+    accelerator = Accelerator(**accelerator_kwargs)
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
