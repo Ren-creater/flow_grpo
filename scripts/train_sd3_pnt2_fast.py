@@ -14,6 +14,7 @@ from ml_collections import config_flags
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
 from diffusers import StableDiffusion3Pipeline
+from omegaconf import OmegaConf
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../TPDM/src")))
 from models.stable_diffusion_3.modeling_sd3_pnt import init_time_predictor
@@ -747,7 +748,24 @@ def main(_):
         config.pretrained.model
     )    
 
-    init_time_predictor(pipeline, config.sd3_checkpoint_path, use_vit_predictor=config.use_vit_predictor)
+    time_predictor_cfg = None
+    config_path = getattr(config, "time_predictor_config_path", None)
+    if config_path:
+        resolved_path = os.path.abspath(os.path.expanduser(config_path))
+        if not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"Time predictor config not found: {resolved_path}")
+        yaml_cfg = OmegaConf.load(resolved_path)
+        if "time_predictor_config" in yaml_cfg:
+            time_predictor_cfg = yaml_cfg["time_predictor_config"]
+        else:
+            time_predictor_cfg = yaml_cfg
+
+    init_time_predictor(
+        pipeline,
+        config.sd3_checkpoint_path,
+        use_vit_predictor=config.use_vit_predictor,
+        time_predictor_config=time_predictor_cfg,
+    )
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)

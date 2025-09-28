@@ -11,7 +11,6 @@ cd ~/flow_grpo/TPDM
 export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
 export OMP_NUM_THREADS=4
 export WANDB_PROJECT="sd35_vit_timepredictor"
-export WANDB_MODE="offline"
 export RUN_NAME="sd35_vit_pnt_$(date +'%Y%m%d_%H%M%S')"
 
 OUTPUT_DIR="outputs/$(date +'%Y-%m-%d')/$RUN_NAME"
@@ -51,7 +50,7 @@ python -m torch.distributed.run --nproc_per_node $NUM_GPUS --nnodes 1 --standalo
     --resume_from_checkpoint true \
     --output_dir $OUTPUT_DIR \
     --run_name $RUN_NAME \
-    --deepspeed configs/deepspeed/deepspeed_stage_1.json \
+    --deepspeed configs/deepspeed/deepspeed_stage_0.json \
     --fp16 true \
     --dataloader_num_workers 4 \
     --remove_unused_columns false

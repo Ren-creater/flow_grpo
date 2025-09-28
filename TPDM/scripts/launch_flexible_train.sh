@@ -15,7 +15,6 @@ cd ~/flow_grpo/TPDM
 export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
 export OMP_NUM_THREADS=4
 export WANDB_PROJECT="timepredictor_experiments"
-export WANDB_MODE="offline"
 
 # Set defaults if not provided
 MODEL_TYPE=${MODEL_TYPE:-sd35}

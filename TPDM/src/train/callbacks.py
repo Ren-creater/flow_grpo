@@ -98,6 +98,15 @@ class DiffusionWandbCallback(WandbCallback):
 
                     concentration = [(alpha - 1) / (alpha + beta - 2) for alpha, beta in zip(alphas[i], betas[i])]
 
+                    # 绘制并保存 sigmas / alphas / betas / concentration
+                    def pil_from_canvas(canvas):
+                        # Use the AGG buffer_rgba() API which is stable across Matplotlib
+                        width, height = canvas.get_width_height()
+                        data = canvas.buffer_rgba()
+                        arr = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 4))
+                        rgb = arr[:, :, :3]
+                        return Image.fromarray(rgb, mode="RGB")
+
                     # 绘制并保存 sigmas
                     fig1, ax1 = plt.subplots()
                     # add first sigma
@@ -108,7 +117,8 @@ class DiffusionWandbCallback(WandbCallback):
                     ax1.legend()
                     canvas1 = FigureCanvas(fig1)
                     canvas1.draw()
-                    image_plot1 = Image.frombytes("RGB", canvas1.get_width_height(), canvas1.tostring_rgb())
+                    image_plot1 = pil_from_canvas(canvas1)
+                    plt.close(fig1)
                     image_plots[i].append(wandb.Image(image_plot1))
 
                     # 绘制并保存 alphas
@@ -119,7 +129,8 @@ class DiffusionWandbCallback(WandbCallback):
                     ax2.legend()
                     canvas2 = FigureCanvas(fig2)
                     canvas2.draw()
-                    image_plot2 = Image.frombytes("RGB", canvas2.get_width_height(), canvas2.tostring_rgb())
+                    image_plot2 = pil_from_canvas(canvas2)
+                    plt.close(fig2)
                     image_plots[i].append(wandb.Image(image_plot2))
 
                     # 绘制并保存 betas
@@ -130,7 +141,8 @@ class DiffusionWandbCallback(WandbCallback):
                     ax3.legend()
                     canvas3 = FigureCanvas(fig3)
                     canvas3.draw()
-                    image_plot3 = Image.frombytes("RGB", canvas3.get_width_height(), canvas3.tostring_rgb())
+                    image_plot3 = pil_from_canvas(canvas3)
+                    plt.close(fig3)
                     image_plots[i].append(wandb.Image(image_plot3))
 
                     # 绘制并保存 concentration
@@ -141,7 +153,8 @@ class DiffusionWandbCallback(WandbCallback):
                     ax4.legend()
                     canvas4 = FigureCanvas(fig4)
                     canvas4.draw()
-                    image_plot4 = Image.frombytes("RGB", canvas4.get_width_height(), canvas4.tostring_rgb())
+                    image_plot4 = pil_from_canvas(canvas4)
+                    plt.close(fig4)
                     image_plots[i].append(wandb.Image(image_plot4))
 
                 # 将图像和 sigma 折线图一一配对并上传到 wandb

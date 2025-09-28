@@ -303,9 +303,7 @@ class CustomSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         pooled_projections: torch.FloatTensor = None,
         timestep: torch.LongTensor = None,
         block_controlnet_hidden_states: List = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        skip_layers: Optional[List[int]] = None,
     ) -> Union[torch.FloatTensor, CustomTransformer2DModelOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
@@ -321,34 +319,14 @@ class CustomSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                 Used to indicate denoising step.
             block_controlnet_hidden_states: (`list` of `torch.Tensor`):
                 A list of tensors that if specified are added to the residuals of transformer blocks.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
                 tuple.
-            skip_layers (`list` of `int`, *optional*):
-                A list of layer indices to skip during the forward pass.
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        if joint_attention_kwargs is not None:
-            joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-                )
 
         height, width = hidden_states.shape[-2:]
 
@@ -359,10 +337,7 @@ class CustomSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         for index_block, block in enumerate(self.transformer_blocks):
-            # Skip specified layers
-            is_skip = True if skip_layers is not None and index_block in skip_layers else False
-
-            if self.training and self.gradient_checkpointing and not is_skip:
+            if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
@@ -373,7 +348,7 @@ class CustomSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
 
                     return custom_forward
 
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False, "joint_attention_kwargs": joint_attention_kwargs} if is_torch_version(">=", "1.11.0") else {"joint_attention_kwargs": joint_attention_kwargs}
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
                 encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
@@ -382,12 +357,11 @@ class CustomSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     **ckpt_kwargs,
                 )
 
-            elif not is_skip:
+            else:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
-                    joint_attention_kwargs=joint_attention_kwargs,
                 )
 
             # controlnet residual

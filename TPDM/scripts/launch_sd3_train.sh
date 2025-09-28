@@ -11,7 +11,6 @@ cd ~/flow_grpo/TPDM
 export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
 export OMP_NUM_THREADS=4
 export WANDB_PROJECT="test"
-export WANDB_MODE="offline"
 export RUN_NAME="test"
 
 OUTPUT_DIR="outputs/$(date +'%Y-%m-%d')/$RUN_NAME"

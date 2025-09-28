@@ -11,7 +11,6 @@ cd ~/flow_grpo/TPDM
 export NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
 export OMP_NUM_THREADS=2
 export WANDB_PROJECT="sd35_vit_timepredictor_test"
-export WANDB_MODE="offline"
 export RUN_NAME="sd35_vit_pnt_test_$(date +'%Y%m%d_%H%M%S')"
 
 OUTPUT_DIR="outputs/$(date +'%Y-%m-%d')/$RUN_NAME"

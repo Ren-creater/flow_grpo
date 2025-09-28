@@ -582,8 +582,8 @@ def general_ocr_sd3_5_pnt_big_1gpu():
 
 def general_ocr_sd3_5_pnt_maxE_1gpu():
     config = general_ocr_sd3_1gpu()
-    config.sample.num_steps = 50
-    config.sample.eval_num_steps = 50
+    config.sample.num_steps = 40
+    config.sample.eval_num_steps = 40
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-1gpu-max'
@@ -623,6 +623,9 @@ def general_ocr_sd3_5_pnt_vit_1gpu():
     config.sd3_checkpoint_path = None
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
     config.train.time_predictor_only_epochs = 4
+    config.time_predictor_config_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "TPDM", "configs", "models", "sd35_pnt_vit.yaml")
+    )
 
     return config
 
@@ -840,8 +843,8 @@ def pickscore_sd3_5_pnt_maxE_1gpu():
 
 def pickscore_sd3_5_pnt_vit_1gpu():
     config = pickscore_sd3_1gpu()
-    config.sample.num_steps = 50
-    config.sample.eval_num_steps = 50
+    config.sample.num_steps = 40
+    config.sample.eval_num_steps = 40
     # sd3.5 medium - local path
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
@@ -1112,6 +1115,7 @@ def general_ocr_sd3_5_pnt_vit_fast_1gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
 
@@ -1121,6 +1125,9 @@ def general_ocr_sd3_5_pnt_vit_fast_1gpu():
     config.sd3_checkpoint_path = None
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
     config.train.time_predictor_only_epochs = 4
+    config.time_predictor_config_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "TPDM", "configs", "models", "sd35_pnt_vit.yaml")
+    )
 
     return config
 

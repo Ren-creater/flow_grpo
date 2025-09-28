@@ -313,8 +313,8 @@ def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, 
     This function uses the saved hidden states and temporal embeddings to recompute
     the time predictor logprob for a specific sigma transition.
     """
-    current_batch_size = sample["latents"].shape[0]
-    device = sample["latents"].device
+    current_batch_size = sample["sigmas"].shape[0]
+    device = sample["sigmas"].device
     
     # Get current and next sigmas for this timestep
     current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
@@ -452,8 +452,8 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
     Compute the KL divergence between the time predictor's predicted Beta distribution
     and a reference Beta distribution for step j.
     """
-    current_batch_size = sample["latents"].shape[0]
-    device = sample["latents"].device
+    current_batch_size = sample["sigmas"].shape[0]
+    device = sample["sigmas"].device
     
     # Get current sigmas for this timestep to compute reference distribution
     current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
@@ -1120,20 +1120,36 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, time_predictor_log_probs, timesteps_per_sample, all_sigmas_per_step, hidden_states_combineds, tembs = pipeline_with_logprob(
-                        pipeline,
-                        prompt_embeds=prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
-                        negative_prompt_embeds=sample_neg_prompt_embeds,
-                        negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
-                        num_inference_steps=config.sample.num_steps,
-                        guidance_scale=config.sample.guidance_scale,
-                        output_type="pt",
-                        height=config.resolution,
-                        width=config.resolution, 
-                        noise_level=config.sample.noise_level,
-                        generator=generator
-                )
+                    if is_time_predictor_only_phase:
+                        images, _, _, time_predictor_log_probs, timesteps_per_sample, all_sigmas_per_step, hidden_states_combineds, tembs = pipeline_with_logprob(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds,
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution, 
+                            noise_level=config.sample.noise_level,
+                            generator=generator
+                        )
+                    else:
+                        images, latents, log_probs, time_predictor_log_probs, timesteps_per_sample, all_sigmas_per_step, hidden_states_combineds, tembs = pipeline_with_logprob(
+                            pipeline,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            negative_prompt_embeds=sample_neg_prompt_embeds,
+                            negative_pooled_prompt_embeds=sample_neg_pooled_prompt_embeds,
+                            num_inference_steps=config.sample.num_steps,
+                            guidance_scale=config.sample.guidance_scale,
+                            output_type="pt",
+                            height=config.resolution,
+                            width=config.resolution, 
+                            noise_level=config.sample.noise_level,
+                            generator=generator
+                        )
 
             # Stack only what we need depending on training phase to save memory
             if not is_time_predictor_only_phase:

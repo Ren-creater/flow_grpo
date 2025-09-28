@@ -22,4 +22,4 @@ class CustomRLOOConfig(RLOOConfig):
     init_beta: float = 0.5
     relative: bool = True
     prediction_type: str = "alpha_beta"
-    max_inference_steps: int = 28
+    max_inference_steps: int = 40#28

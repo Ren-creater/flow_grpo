@@ -427,7 +427,49 @@ class CommonRLOOTrainer(RLOOTrainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
-                # TODO: expand the data by the number of rloo_k
+                # If the policy uses the ViT time predictor, ensure we provide
+                # text embeddings to the model so `only_predict_logprobs` can
+                # consume them during logprob recomputation. Compute embeddings
+                # here and attach to the data dict before repeating for rloo_k.
+                if hasattr(model, "use_vit_predictor") and model.use_vit_predictor:
+                    # model.encode_prompt returns (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
+                    try:
+                        # The data['prompt'] is expected to be a list of strings
+                        prompt_list = data.get("prompt", None)
+                        if prompt_list is not None:
+                            # compute embeddings WITH classifier free guidance negatives so both
+                            # positive and negative embeddings are available for CFG and ViT
+                            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = model.encode_prompt(
+                                prompt=prompt_list,
+                                device=model._execution_device if hasattr(model, "_execution_device") else None,
+                                num_images_per_prompt=1,
+                                do_classifier_free_guidance=True,
+                            )
+
+                            # ensure tensors are on the model device and align dtype where possible
+                            try:
+                                tgt_device = model._execution_device if hasattr(model, "_execution_device") else self.accelerator.device
+                                tgt_dtype = next(model.parameters()).dtype
+                                prompt_embeds = prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
+                                negative_prompt_embeds = negative_prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
+                                pooled_prompt_embeds = pooled_prompt_embeds.to(device=tgt_device)
+                                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=tgt_device)
+                            except Exception:
+                                # fallback: put on accelerator device without dtype cast
+                                prompt_embeds = prompt_embeds.to(device=self.accelerator.device)
+                                negative_prompt_embeds = negative_prompt_embeds.to(device=self.accelerator.device)
+                                pooled_prompt_embeds = pooled_prompt_embeds.to(device=self.accelerator.device)
+                                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=self.accelerator.device)
+
+                            # attach to data so model.logprobs / compute_time_predictor_* can use them
+                            data["prompt_embeds"] = prompt_embeds
+                            data["negative_prompt_embeds"] = negative_prompt_embeds
+                            data["pooled_prompt_embeds"] = pooled_prompt_embeds
+                            data["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+                    except Exception as e:
+                        logger.warning(f"Failed to compute prompt embeddings for ViT predictor: {e}")
+
+                # expand the data by the number of rloo_k
                 data = model.rloo_repeat(data, args.rloo_k)
                 outputs = model.sample(data)
                 scores, last_image_rewards = model.reward(

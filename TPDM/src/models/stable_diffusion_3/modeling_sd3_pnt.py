@@ -1,6 +1,7 @@
 import logging
 from typing import List, Optional, Union
 from dataclasses import dataclass
+from omegaconf import DictConfig
 
 import pyrootutils
 import torch
@@ -30,7 +31,7 @@ from src.models.stable_diffusion_3.transformer_sd3 import CustomSD3Transformer2D
 
 logger = logging.getLogger(__name__)
 
-from diffusers.loaders import FromSingleFileMixin, SD3IPAdapterMixin, SD3LoraLoaderMixin
+from diffusers.loaders import FromSingleFileMixin
 from diffusers.utils import (
     USE_PEFT_BACKEND,
     scale_lora_layers,
@@ -301,11 +302,25 @@ class ViTTimePredictor(nn.Module):
             stride=config.patch_size
         )
         
+        # Determine number of patches. Support both dataclass instances and
+        # OmegaConf DictConfig (used by Hydra). Avoid using exceptions for
+        # control flow: explicitly check for DictConfig and use `.get` there,
+        # otherwise use attribute access with getattr and a None default.
+        if isinstance(config, DictConfig):
+            num_patches = config.get("num_patches", None)
+            if num_patches is None:
+                num_patches = (int(config.get("image_size")) // int(config.get("patch_size"))) ** 2
+        else:
+            # dataclass or regular object
+            num_patches = getattr(config, "num_patches", None)
+            if num_patches is None:
+                num_patches = (int(getattr(config, "image_size")) // int(getattr(config, "patch_size"))) ** 2
+
         # Positional embedding
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, config.num_patches + 1, config.hidden_size)
+            torch.zeros(1, num_patches + 1, config.hidden_size)
         )
-        
+
         # Class token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         
@@ -531,7 +546,7 @@ def load_time_predictor(pipeline, ckpt_path):
         time_predictor_state, strict=True
     )
 
-class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
+class SD3PredictNextTimeStepModel(nn.Module):
     def __init__(
         self,
         pretrained_model_name_or_path,
@@ -622,41 +637,6 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
 
         self.requires_grad_(False)
         self.eval()
-
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
-    @property
-    def skip_guidance_layers(self):
-        return self._skip_guidance_layers
-
-    @property
-    def clip_skip(self):
-        return self._clip_skip
-
-    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
-    # corresponds to doing no classifier free guidance.
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1
-
-    @property
-    def joint_attention_kwargs(self):
-        return self._joint_attention_kwargs
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def interrupt(self):
-        return self._interrupt
-
-    @property
-    def _execution_device(self):
-        return self.vae.device
     
     def _get_t5_prompt_embeds(
         self,
@@ -761,20 +741,8 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         clip_skip: Optional[int] = None,
         max_sequence_length: int = 256,
-        lora_scale: Optional[float] = None,
     ):
         device = device or self.vae.device
-
-        # set lora scale so that monkey patched LoRA
-        # function of text encoder can correctly access it
-        if lora_scale is not None and isinstance(self, SD3LoraLoaderMixin):
-            self._lora_scale = lora_scale
-
-            # dynamically adjust the LoRA scale
-            if self.text_encoder is not None and USE_PEFT_BACKEND:
-                scale_lora_layers(self.text_encoder, lora_scale)
-            if self.text_encoder_2 is not None and USE_PEFT_BACKEND:
-                scale_lora_layers(self.text_encoder_2, lora_scale)
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         if prompt is not None:
@@ -881,16 +849,6 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
             negative_pooled_prompt_embeds = torch.cat(
                 [negative_pooled_prompt_embed, negative_pooled_prompt_2_embed], dim=-1
             )
-
-        if self.text_encoder is not None:
-            if isinstance(self, SD3LoraLoaderMixin) and USE_PEFT_BACKEND:
-                # Retrieve the original scale by scaling back the LoRA layers
-                unscale_lora_layers(self.text_encoder, lora_scale)
-
-        if self.text_encoder_2 is not None:
-            if isinstance(self, SD3LoraLoaderMixin) and USE_PEFT_BACKEND:
-                # Retrieve the original scale by scaling back the LoRA layers
-                unscale_lora_layers(self.text_encoder_2, lora_scale)
 
         return (
             prompt_embeds,
@@ -1035,17 +993,7 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
 
             # Call time predictor with appropriate inputs
             if self.use_vit_predictor:
-                # For ViT, extract text embeddings from prompt_embeds
-                if guidance_scale is not None:
-                    # During CFG, prompt_embeds contains [negative, positive] concatenated
-                    # We want the positive part for text conditioning
-                    text_embeds = prompt_embeds[batch_size:]  # Take the positive part
-                    # Also extract negative part for timestep conditioning if needed
-                    timestep_embeds = pooled_prompt_embeds[batch_size:]  # Use pooled embeds as timestep
-                else:
-                    text_embeds = prompt_embeds
-                    timestep_embeds = pooled_prompt_embeds
-                time_preds = self.time_predictor(hidden_states_combined, text_embeds, timestep_embeds)
+                time_preds = self.time_predictor(hidden_states_combined, temb, prompt_embeds)
             else:
                 # For CNN, use pooled embeddings as temporal embedding (original behavior)
                 time_preds = self.time_predictor(hidden_states_combined, temb)
@@ -1195,7 +1143,7 @@ class SD3PredictNextTimeStepModel(nn.Module, SD3LoraLoaderMixin):
             # Call time predictor with appropriate inputs
             if self.use_vit_predictor and fix_text_embeds is not None:
                 # For ViT with text embeddings, also use temb as timestep embedding
-                time_pred = self.time_predictor(fix_hidden_states_combined, fix_text_embeds, fix_temb)
+                time_pred = self.time_predictor(fix_hidden_states_combined, fix_temb, fix_text_embeds)
             else:
                 # For CNN or when text embeddings not available
                 time_pred = self.time_predictor(fix_hidden_states_combined, fix_temb)
@@ -1266,11 +1214,22 @@ class SD3PredictNextTimeStepModelRLOOWrapper(nn.Module):
         self.relative = relative
         self.fsdp = fsdp
         self.max_inference_steps = max_inference_steps
+        # Expose this flag on the wrapper so other methods can inspect it
+        self.use_vit_predictor = use_vit_predictor
 
         self.agent_model.requires_grad_(False)
 
         self.agent_model.time_predictor.train()
         self.agent_model.time_predictor.requires_grad_(True)
+
+    def encode_prompt(self, *args, **kwargs):
+        """Delegate prompt encoding to the inner agent_model.
+
+        Keeps the same signature as SD3PredictNextTimeStepModel.encode_prompt and
+        ensures callers can always call `model.encode_prompt(...)` even when they
+        hold the wrapper instance.
+        """
+        return self.agent_model.encode_prompt(*args, **kwargs)
 
         # self.ref_alpha, self.ref_beta = 15.0, 1.5
         # self.ref_distribution = torch.distributions.Beta(self.ref_alpha, self.ref_beta)
@@ -1369,16 +1328,47 @@ class SD3PredictNextTimeStepModelRLOOWrapper(nn.Module):
         # outputs = self.agent_model(latents=outputs["init_noise_latents"], fix_sigmas=outputs["sigmas"], **inputs)
         if len(self.fsdp) > 0:
             with FullyShardedDataParallel.summon_full_params(self):
+                fix_text_embeds = None
+                if self.use_vit_predictor:
+                    # Try to obtain precomputed positive/negative prompt embeddings from inputs.
+                    pos = inputs.get("prompt_embeds", None)
+                    neg = inputs.get("negative_prompt_embeds", None)
+                    guidance = inputs.get("guidance_scale", None)
+                    # If negative embeddings are available and CFG appears to be used, combine
+                    # them the same way sampling does (neg first, then positive) so the
+                    # ViT predictor sees the same encoder context during logprob recomputation.
+                    if neg is not None and pos is not None and guidance is not None and guidance != 1:
+                        try:
+                            fix_text_embeds = torch.cat([neg, pos], dim=0)
+                        except Exception:
+                            # Fallback: if shapes mismatched, prefer pos
+                            fix_text_embeds = pos
+                    else:
+                        fix_text_embeds = pos
                 outputs = self.agent_model.only_predict_logprobs(
                     fix_sigmas=outputs["sigmas"],
                     fix_hidden_states_combineds=outputs["hidden_states_combineds"],
                     fix_tembs=outputs["tembs"],
+                    fix_text_embeds=fix_text_embeds,
                 )
         else:
+            fix_text_embeds = None
+            if self.use_vit_predictor:
+                pos = inputs.get("prompt_embeds", None)
+                neg = inputs.get("negative_prompt_embeds", None)
+                guidance = inputs.get("guidance_scale", None)
+                if neg is not None and pos is not None and guidance is not None and guidance != 1:
+                    try:
+                        fix_text_embeds = torch.cat([neg, pos], dim=0)
+                    except Exception:
+                        fix_text_embeds = pos
+                else:
+                    fix_text_embeds = pos
             outputs = self.agent_model.only_predict_logprobs(
                 fix_sigmas=outputs["sigmas"],
                 fix_hidden_states_combineds=outputs["hidden_states_combineds"],
                 fix_tembs=outputs["tembs"],
+                fix_text_embeds=fix_text_embeds,
             )
         return outputs["logprobs"]
 
