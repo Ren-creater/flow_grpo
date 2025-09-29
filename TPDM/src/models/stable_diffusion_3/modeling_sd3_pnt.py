@@ -542,23 +542,83 @@ def init_time_predictor(
 
 
 def load_time_predictor(pipeline, ckpt_path):
-    from safetensors.torch import load_file
-    state_dict = load_file(ckpt_path)
+    """
+    Robust loader for time_predictor weights.
 
-    # Check if keys already start with "time_predictor."
-    if all(k.startswith("time_predictor.") for k in state_dict.keys()):
-        # Strip the prefix so it matches the submodule
-        time_predictor_state = {
-            k.replace("time_predictor.", "", 1): v for k, v in state_dict.items()
-        }
-    else:
-        # Assume it is already the submodule dict
-        time_predictor_state = state_dict
+    Supports:
+    - safetensors single-file mappings where keys may start with "time_predictor." or be already the submodule keys
+    - PyTorch checkpoints (including DeepSpeed mp_rank shards) where the model weights are stored under nested keys like
+      'module', 'state_dict', or top-level names containing 'time_predictor'.
 
-    # Load into the submodule
-    pipeline.time_predictor.load_state_dict(
-        time_predictor_state, strict=True
-    )
+    The function will try to find keys related to the time_predictor submodule and load them. It falls back to a
+    non-strict load so missing/unexpected keys don't crash the init process.
+    """
+    time_predictor_state = None
+    # First try safetensors loader (fast, common for diffusers checkpoints)
+    try:
+        from safetensors.torch import load_file as _safetensors_load
+
+        raw = _safetensors_load(ckpt_path)
+        # convert to plain dict (OrderedDict-like)
+        state_dict = dict(raw)
+    except Exception:
+        # Fallback to torch.load for .pt / deepspeed shards
+        try:
+            state = torch.load(ckpt_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint {ckpt_path}: {e}")
+
+        # If this is a DeepSpeed / HF shard, weights may be under keys like 'module' or 'state_dict'
+        if isinstance(state, dict):
+            if "state_dict" in state and isinstance(state["state_dict"], dict):
+                state_dict = state["state_dict"]
+            elif "module" in state and isinstance(state["module"], dict):
+                state_dict = state["module"]
+            else:
+                state_dict = state
+        else:
+            # unexpected object, try to use it directly
+            raise RuntimeError(f"Unsupported checkpoint object type: {type(state)}")
+
+    # Determine loading strategy depending on key naming
+    keys = list(state_dict.keys())
+
+    # Case A: keys already belong to the submodule (e.g. 'predictor.pos_embed' or start with 'predictor.')
+    submodule_keys = [k for k in keys if k.startswith("predictor.") or k.startswith("predictor")]
+    if len(submodule_keys) > 0:
+        # direct strict load
+        try:
+            pipeline.time_predictor.load_state_dict({k: state_dict[k] for k in submodule_keys}, strict=True)
+            return
+        except Exception:
+            # fall through to more lenient handling
+            pass
+
+    # Case B: top-level keys start with 'time_predictor.' (older format) -> strip prefix and strict load
+    if all(k.startswith("time_predictor.") for k in keys):
+        tp_state = {k.replace("time_predictor.", "", 1): v for k, v in state_dict.items()}
+        pipeline.time_predictor.load_state_dict(tp_state, strict=True)
+        return
+
+    # Case C: nested layout like 'agent_model.time_predictor.predictor.*' or any key containing '.time_predictor.'
+    tp_state = {}
+    for k, v in state_dict.items():
+        if ".time_predictor." in k:
+            # keep only the suffix after the first '.time_predictor.'
+            suffix = k.split(".time_predictor.", 1)[1]
+            tp_state[suffix] = v
+        elif k.startswith("agent_model.time_predictor"):
+            # handle direct 'agent_model.time_predictor.*' prefix
+            suffix = k.replace("agent_model.time_predictor.", "", 1)
+            tp_state[suffix] = v
+
+    if len(tp_state) > 0:
+        # lenient load for nested/deepspeed formats
+        pipeline.time_predictor.load_state_dict(tp_state, strict=False)
+        return
+
+    # Last resort: try to load the entire dict non-strictly
+    pipeline.time_predictor.load_state_dict(state_dict, strict=False)
 
 class SD3PredictNextTimeStepModel(nn.Module):
     def __init__(

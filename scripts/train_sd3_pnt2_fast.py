@@ -718,11 +718,22 @@ def main(_):
         "gradient_accumulation_steps": config.train.gradient_accumulation_steps * num_train_timesteps,
     }
     
-    # Add DDP kwargs if we have time_predictor-only training
-    if time_predictor_only_epochs > 0:
+    # Determine if we need to enable find_unused_parameters for DDP
+    enable_find_unused = (
+        time_predictor_only_epochs > 0
+        or getattr(config.train, "find_unused_parameters", False)
+        or getattr(config, "require_find_unused_parameters", False)
+        or getattr(config, "use_vit_predictor", False)
+    )
+
+    if enable_find_unused:
         from accelerate.utils import DistributedDataParallelKwargs
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+
+        existing_handlers = list(accelerator_kwargs.get("kwargs_handlers", []))
+        existing_handlers.append(
+            DistributedDataParallelKwargs(find_unused_parameters=True)
+        )
+        accelerator_kwargs["kwargs_handlers"] = existing_handlers
 
     # Ensure any prepared kwargs (e.g. DDP find_unused_parameters handler) are passed
     # into Accelerator. We also make certain the gradient_accumulation_steps matches
