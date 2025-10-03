@@ -1112,7 +1112,7 @@ def general_ocr_sd3_5_pnt_vit_fast_1gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-09-28/sd35_vit_pnt_pickscore_hx1_20250928_192506/checkpoint-100/model.safetensors")
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-01/sd35_vit_captions_20251001_192616/checkpoint-300/model.safetensors")
     #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit'
@@ -1125,6 +1125,24 @@ def general_ocr_sd3_5_pnt_vit_fast_1gpu():
 
     return config
 
+def general_ocr_sd3_5_pnt_vit_image_fast_1gpu():
+    config = general_ocr_sd3_fast_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-02/sd35_vit_image_captions_20251002_180553/checkpoint-300/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/ocr/sd3-5-M-pnt-vit-image'
+    config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit_image.yaml")
+    config.use_image_time_predictor = True
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 0
+
+    return config
 
 ################ Pickscore FAST 1 GPU #############
 
@@ -1206,15 +1224,35 @@ def pickscore_sd3_5_pnt_vit_fast_1gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-01/sd35_vit_captions_20251001_192616/checkpoint-300/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
+    config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit.yaml")
 
     # Add time predictor checkpoint path for resuming
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
-    # Alternative checkpoint path if needed
-    config.sd3_checkpoint_path = None
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
-    config.train.time_predictor_only_epochs = 4
+    config.train.time_predictor_only_epochs = 0
+
+    return config
+
+def pickscore_sd3_5_pnt_vit_image_fast_1gpu():
+    config = pickscore_sd3_fast_1gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-02/sd35_vit_image_captions_20251002_180553/checkpoint-300/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit-image'
+    config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit_image.yaml")
+    config.use_image_time_predictor = True
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 0
 
     return config
 

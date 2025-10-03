@@ -5,12 +5,40 @@
 # - Adapted to work with SD3PredictNextTimeStepModel instead of StableDiffusion3Pipeline
 from typing import Any, Dict, List, Optional, Union
 import torch
+import torch.nn.functional as F
 import random
 from .sd3_pnt_sde_with_logprob import sde_step_with_logprob
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../TPDM/src")))
 from models.stable_diffusion_3.modeling_sd3_pnt import reshape_hidden_states_to_2d
+
+
+def _decode_latents_for_time_predictor(pipeline, latents: torch.Tensor) -> torch.Tensor:
+    """Decode latents to RGB space for image-conditioned time predictors."""
+    scaled_latents = (latents / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
+    scaled_latents = scaled_latents.to(dtype=pipeline.vae.dtype)
+    decoded = pipeline.vae.decode(scaled_latents, return_dict=False)[0]
+
+    target_size = getattr(pipeline, "time_predictor_image_size", None)
+    if target_size is not None and (
+        decoded.shape[-1] != target_size or decoded.shape[-2] != target_size
+    ):
+        decoded = F.interpolate(
+            decoded,
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    # Match the predictor's parameter dtype for numerical stability when possible
+    try:
+        predictor_dtype = next(pipeline.time_predictor.parameters()).dtype
+    except StopIteration:
+        predictor_dtype = decoded.dtype
+    if decoded.dtype != predictor_dtype:
+        decoded = decoded.to(dtype=predictor_dtype)
+    return decoded
 
 @torch.no_grad()
 def pipeline_with_logprob(
@@ -196,21 +224,25 @@ def pipeline_with_logprob(
                 hidden_states_2_text - hidden_states_2_uncond
             )
 
-        # Reshape and combine hidden states for time predictor
-        hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
-        hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
-        hidden_states_combined = torch.cat([hidden_states_1, hidden_states_2], dim=1)
+        # Prepare inputs for the time predictor (hidden states or decoded images)
+        if getattr(self, "uses_image_time_predictor", False):
+            time_predictor_inputs = _decode_latents_for_time_predictor(self, latents)
+        else:
+            hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
+            hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
+            time_predictor_inputs = torch.cat([hidden_states_1, hidden_states_2], dim=1)
         
         # Store hidden states and temporal embeddings only for training window
         if step >= random_timestep and step < random_timestep + train_num_steps:
-            all_hidden_states_combineds.append(hidden_states_combined.half().cpu())
-            all_tembs.append(temb.half().cpu())
+            stored_inputs = time_predictor_inputs.detach()
+            all_hidden_states_combineds.append(stored_inputs.half().cpu())
+            all_tembs.append(temb.detach().half().cpu())
 
         # Predict next sigma using time predictor and collect logprobs
         if self.use_vit_predictor:
-            time_preds = self.time_predictor(hidden_states_combined, temb, prompt_embeds)
+            time_preds = self.time_predictor(time_predictor_inputs, temb, prompt_embeds)
         else:
-            time_preds = self.time_predictor(hidden_states_combined, temb)
+            time_preds = self.time_predictor(time_predictor_inputs, temb)
         current_batch_size = len(latents)
         sigma_next = torch.zeros_like(sigma)
         step_time_predictor_log_probs = torch.zeros_like(sigma)

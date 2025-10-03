@@ -14,7 +14,7 @@ from ml_collections import config_flags
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
 from diffusers import StableDiffusion3Pipeline
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../TPDM/src")))
 from models.stable_diffusion_3.modeling_sd3_pnt import init_time_predictor
@@ -775,6 +775,29 @@ def main(_):
             time_predictor_cfg = yaml_cfg["time_predictor_config"]
         else:
             time_predictor_cfg = yaml_cfg
+
+    use_image_time_predictor = getattr(config, "use_image_time_predictor", False)
+    if use_image_time_predictor and not getattr(config, "use_vit_predictor", False):
+        raise ValueError("Image-based time predictor requires use_vit_predictor=True")
+
+    if use_image_time_predictor:
+        if time_predictor_cfg is None:
+            raise ValueError(
+                "use_image_time_predictor=True requires a time_predictor_config_path with decoded_image settings"
+            )
+        image_size_override = getattr(config, "time_predictor_image_size", None)
+        if isinstance(time_predictor_cfg, DictConfig):
+            time_predictor_cfg.input_type = "decoded_image"
+            if not time_predictor_cfg.get("in_channels", None):
+                time_predictor_cfg.in_channels = 3
+            if image_size_override is not None and not time_predictor_cfg.get("image_size", None):
+                time_predictor_cfg.image_size = image_size_override
+        else:
+            setattr(time_predictor_cfg, "input_type", "decoded_image")
+            if getattr(time_predictor_cfg, "in_channels", None) is None:
+                setattr(time_predictor_cfg, "in_channels", 3)
+            if image_size_override is not None and getattr(time_predictor_cfg, "image_size", None) is None:
+                setattr(time_predictor_cfg, "image_size", image_size_override)
 
     init_time_predictor(
         pipeline,

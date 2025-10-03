@@ -26,6 +26,11 @@ def get_config():
     config.use_lora = True
     config.dataset = ""
     config.resolution = 768
+    # Time predictor configuration options
+    config.use_vit_predictor = False
+    config.use_image_time_predictor = False
+    config.time_predictor_config_path = None
+    config.time_predictor_image_size = None
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()

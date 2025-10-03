@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Literal
 from dataclasses import dataclass
 from omegaconf import DictConfig
 
@@ -179,6 +179,7 @@ class TimePredictorConfig:
     text_embed_dim: int = 1536  # Text embedding dimension
     timestep_embed_dim: int = 1536  # Timestep embedding dimension
     projection_dim: int = 2
+    input_type: Literal["hidden_states", "decoded_image"] = "hidden_states"
     
     # Initialization parameters
     init_alpha: float = 1.5
@@ -307,13 +308,23 @@ class ViTTimePredictor(nn.Module):
     def __init__(self, config: TimePredictorConfig):
         super().__init__()
         self.config = config
+        if isinstance(config, DictConfig):
+            self.image_size = int(config.get("image_size", 64))
+            self.patch_size = int(config.get("patch_size", 8))
+            self.in_channels = int(config.get("in_channels", 3))
+            self.input_type = config.get("input_type", "hidden_states")
+        else:
+            self.image_size = int(getattr(config, "image_size"))
+            self.patch_size = int(getattr(config, "patch_size"))
+            self.in_channels = int(getattr(config, "in_channels"))
+            self.input_type = getattr(config, "input_type", "hidden_states")
         
         # Patch embedding
         self.patch_embed = nn.Conv2d(
-            config.in_channels, 
-            config.hidden_size, 
-            kernel_size=config.patch_size, 
-            stride=config.patch_size
+            self.in_channels,
+            config.hidden_size,
+            kernel_size=self.patch_size,
+            stride=self.patch_size
         )
         
         # Determine number of patches. Support both dataclass instances and
@@ -407,6 +418,22 @@ class ViTTimePredictor(nn.Module):
             attention_mask: (B, seq_len) - Attention mask for text
         """
         B = hidden_states_combined.shape[0]
+
+        if self.input_type == "decoded_image":
+            if (
+                hidden_states_combined.shape[-1] != self.image_size
+                or hidden_states_combined.shape[-2] != self.image_size
+            ):
+                hidden_states_combined = F.interpolate(
+                    hidden_states_combined,
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+        patch_dtype = self.patch_embed.weight.dtype
+        if hidden_states_combined.dtype != patch_dtype:
+            hidden_states_combined = hidden_states_combined.to(dtype=patch_dtype)
         
         # Patch embedding: (B, C, H, W) -> (B, num_patches, hidden_size)
         x = self.patch_embed(hidden_states_combined)  # (B, hidden_size, H//patch_size, W//patch_size)
@@ -531,6 +558,27 @@ def init_time_predictor(
     
     self.time_predictor = self.time_predictor.to(dtype=self.vae.dtype)
     self.use_vit_predictor = use_vit_predictor
+    # Track how the time predictor expects its inputs so downstream utilities can
+    # prepare the right features (hidden states vs decoded images).
+    self.time_predictor_input_type = "hidden_states"
+    self.time_predictor_image_size: Optional[int] = None
+    self.uses_image_time_predictor = False
+    if self.use_vit_predictor:
+        predictor_module = getattr(self.time_predictor, "predictor", None)
+        predictor_config = getattr(predictor_module, "config", None)
+        if predictor_config is not None:
+            if isinstance(predictor_config, DictConfig):
+                self.time_predictor_input_type = predictor_config.get("input_type", "hidden_states")
+                image_size_value = predictor_config.get("image_size", None)
+            else:
+                self.time_predictor_input_type = getattr(predictor_config, "input_type", "hidden_states")
+                image_size_value = getattr(predictor_config, "image_size", None)
+            if image_size_value is not None:
+                try:
+                    self.time_predictor_image_size = int(image_size_value)
+                except (TypeError, ValueError):
+                    self.time_predictor_image_size = None
+    self.uses_image_time_predictor = self.time_predictor_input_type == "decoded_image"
 
     self.min_sigma = min_sigma
     self.relative = relative
@@ -667,6 +715,25 @@ class SD3PredictNextTimeStepModel(nn.Module):
         
         self.time_predictor = self.time_predictor.to(dtype=self.vae.dtype)
         self.use_vit_predictor = use_vit_predictor
+        self.time_predictor_input_type = "hidden_states"
+        self.time_predictor_image_size: Optional[int] = None
+        self.uses_image_time_predictor = False
+        if self.use_vit_predictor:
+            predictor_module = getattr(self.time_predictor, "predictor", None)
+            predictor_config = getattr(predictor_module, "config", None)
+            if predictor_config is not None:
+                if isinstance(predictor_config, DictConfig):
+                    self.time_predictor_input_type = predictor_config.get("input_type", "hidden_states")
+                    image_size_value = predictor_config.get("image_size", None)
+                else:
+                    self.time_predictor_input_type = getattr(predictor_config, "input_type", "hidden_states")
+                    image_size_value = getattr(predictor_config, "image_size", None)
+                if image_size_value is not None:
+                    try:
+                        self.time_predictor_image_size = int(image_size_value)
+                    except (TypeError, ValueError):
+                        self.time_predictor_image_size = None
+            self.uses_image_time_predictor = self.time_predictor_input_type == "decoded_image"
         self.scheduler = CustomFlowMatchEulerDiscreteScheduler.from_pretrained(
             pretrained_model_name_or_path, subfolder="scheduler"
         )
@@ -952,6 +1019,24 @@ class SD3PredictNextTimeStepModel(nn.Module):
 
         return latents
 
+    def _decode_latents_for_time_predictor(self, latents: torch.FloatTensor) -> torch.FloatTensor:
+        """Decode latent tensors into RGB space for the image-conditioned time predictor."""
+        scaled_latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        decoded = self.vae.decode(scaled_latents, return_dict=False)[0]
+        decoded = decoded.to(dtype=self.vae.dtype)
+        if self.time_predictor_image_size is not None:
+            if (
+                decoded.shape[-1] != self.time_predictor_image_size
+                or decoded.shape[-2] != self.time_predictor_image_size
+            ):
+                decoded = F.interpolate(
+                    decoded,
+                    size=(self.time_predictor_image_size, self.time_predictor_image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        return decoded
+
     def forward(
         self,
         prompt: Union[str, List[str]] = None,
@@ -1055,18 +1140,24 @@ class SD3PredictNextTimeStepModel(nn.Module):
                     hidden_states_2_text - hidden_states_2_uncond
                 )
 
-            hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
-            hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
-            hidden_states_combined = torch.cat([hidden_states_1, hidden_states_2], dim=1)
-            hidden_states_combineds.append(hidden_states_combined.cpu())
+            if self.uses_image_time_predictor:
+                predictor_input = self._decode_latents_for_time_predictor(latents)
+            else:
+                hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
+                hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
+                predictor_input = torch.cat([hidden_states_1, hidden_states_2], dim=1)
+
+            hidden_states_combineds.append(
+                predictor_input.detach().to(device="cpu", dtype=predictor_input.dtype)
+            )
             tembs.append(temb)
 
             # Call time predictor with appropriate inputs
             if self.use_vit_predictor:
-                time_preds = self.time_predictor(hidden_states_combined, temb, prompt_embeds)
+                time_preds = self.time_predictor(predictor_input, temb, prompt_embeds)
             else:
                 # For CNN, use pooled embeddings as temporal embedding (original behavior)
-                time_preds = self.time_predictor(hidden_states_combined, temb)
+                time_preds = self.time_predictor(predictor_input, temb)
             sigma_next = torch.zeros_like(sigma)
             for i, (param1, param2) in enumerate(time_preds):
                 if self.prediction_type == "alpha_beta":
