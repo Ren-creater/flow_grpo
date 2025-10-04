@@ -375,7 +375,7 @@ def general_ocr_sd3_1gpu():
     config.resolution = 512
     config.sample.train_batch_size = 8
     config.sample.num_image_per_prompt = 8
-    config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.num_batches_per_epoch = int(2/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # 16 is a special design, the test set has a total of 1018, to make 8*16*n as close as possible to 1018, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -783,7 +783,7 @@ def pickscore_sd3_1gpu():
     config.resolution = 512
     config.sample.train_batch_size = 8
     config.sample.num_image_per_prompt = 8
-    config.sample.num_batches_per_epoch = int(8/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.num_batches_per_epoch = int(2/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -805,6 +805,8 @@ def pickscore_sd3_1gpu():
     config.prompt_fn = "general_ocr"
 
     config.per_prompt_stat_tracking = True
+    config.train.lora_path = os.path.expanduser("~/flow_grpo/SD3.5M-FlowGRPO-PickScore")
+
     return config
 
 def pickscore_sd3_5_pnt_max_1gpu():

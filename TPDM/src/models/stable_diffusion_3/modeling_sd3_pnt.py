@@ -1,6 +1,9 @@
+import glob
 import logging
 import math
-from typing import List, Optional, Union, Literal
+import os
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Union, Literal
 from dataclasses import dataclass
 from omegaconf import DictConfig
 
@@ -31,6 +34,24 @@ from src.models.stable_diffusion_3.transformer_sd3 import CustomSD3Transformer2D
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_LORA_TARGET_MODULES = [
+    "attn.add_k_proj",
+    "attn.add_q_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    "attn.to_k",
+    "attn.to_out.0",
+    "attn.to_q",
+    "attn.to_v",
+]
+
+try:
+    from peft import LoraConfig, PeftModel, get_peft_model
+except ImportError:  # pragma: no cover - optional dependency
+    LoraConfig = None
+    PeftModel = None
+    get_peft_model = None
 
 from diffusers.loaders import FromSingleFileMixin
 from diffusers.utils import (
@@ -1356,8 +1377,32 @@ class SD3PredictNextTimeStepModelRLOOWrapper(nn.Module):
         max_inference_steps: int = 28,
         use_vit_predictor: bool = False,
         time_predictor_config: Optional[TimePredictorConfig] = None,
+        use_lora: bool = False,
+        lora_config: Optional[Dict[str, Any]] = None,
+        time_predictor_path: Optional[str] = None,
     ):
         super(SD3PredictNextTimeStepModelRLOOWrapper, self).__init__()
+
+        if isinstance(lora_config, DictConfig):
+            lora_config = {k: lora_config[k] for k in lora_config.keys()}
+        elif isinstance(lora_config, Mapping):
+            lora_config = dict(lora_config)
+        elif lora_config is None:
+            lora_config = {}
+        else:
+            raise TypeError(
+                "`lora_config` must be a mapping-like object or None when enabling LoRA support."
+            )
+
+        self.lora_config: Dict[str, Any] = {k: v for k, v in lora_config.items()}
+        enabled_flag = self.lora_config.pop("enabled", False)
+        self.use_lora = bool(use_lora or enabled_flag)
+        self._lora_scale: Optional[float] = None
+        self.lora_trainable_parameter_names: List[str] = []
+        self.time_predictor_path = (
+            os.path.expanduser(time_predictor_path) if isinstance(time_predictor_path, str) else None
+        )
+
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.agent_model = SD3PredictNextTimeStepModel(
             pretrained_model_name_or_path,
@@ -1382,6 +1427,170 @@ class SD3PredictNextTimeStepModelRLOOWrapper(nn.Module):
 
         self.agent_model.time_predictor.train()
         self.agent_model.time_predictor.requires_grad_(True)
+        self._setup_lora_adapters()
+        self._load_time_predictor_checkpoint()
+
+    def _setup_lora_adapters(self) -> None:
+        """Initialize and configure LoRA adapters for the transformer, if requested."""
+
+        if not self.use_lora:
+            self.lora_trainable_parameter_names = []
+            return
+
+        if get_peft_model is None or LoraConfig is None:
+            raise ImportError(
+                "LoRA training requires the `peft` package, but it is not installed in the environment."
+            )
+
+        default_config = {
+            "r": 32,
+            "alpha": 64,
+            "dropout": 0.0,
+            "target_modules": DEFAULT_LORA_TARGET_MODULES,
+            "init_lora_weights": "gaussian",
+            "path": None,
+            "adapter_name": "default",
+            "scale": None,
+            "bias": "none",
+        }
+
+        alias_map = {
+            "lora_r": "r",
+            "rank": "r",
+            "lora_rank": "r",
+            "lora_alpha": "alpha",
+            "alpha": "alpha",
+            "lora_dropout": "dropout",
+            "dropout": "dropout",
+            "modules": "target_modules",
+            "lora_target_modules": "target_modules",
+            "target_modules": "target_modules",
+            "lora_init": "init_lora_weights",
+            "init_lora_weights": "init_lora_weights",
+            "pretrained_path": "path",
+            "pretrained_lora_path": "path",
+            "lora_path": "path",
+            "path": "path",
+            "adapter": "adapter_name",
+            "adapter_name": "adapter_name",
+            "lora_scale": "scale",
+            "scale": "scale",
+            "bias": "bias",
+        }
+
+        user_config = {k: v for k, v in self.lora_config.items() if v is not None}
+        normalized_config = default_config.copy()
+        for key, value in user_config.items():
+            alias = alias_map.get(key, key)
+            normalized_config[alias] = value
+
+        # Ensure target modules fallback to defaults when provided list is empty.
+        target_modules = normalized_config.get("target_modules") or DEFAULT_LORA_TARGET_MODULES
+        normalized_config["target_modules"] = target_modules
+
+        lora_path = normalized_config.get("path")
+        if lora_path:
+            lora_path = os.path.expanduser(str(lora_path))
+
+        base_transformer = self.agent_model.transformer
+        base_transformer.requires_grad_(False)
+
+        if lora_path:
+            transformer = PeftModel.from_pretrained(
+                base_transformer,
+                lora_path,
+                is_trainable=True,
+            )
+            active_adapter = normalized_config.get("adapter_name") or "default"
+            if hasattr(transformer, "set_adapter"):
+                transformer.set_adapter(active_adapter)
+        else:
+            lora_cfg = LoraConfig(
+                r=int(normalized_config["r"]),
+                lora_alpha=int(normalized_config["alpha"]),
+                init_lora_weights=normalized_config.get("init_lora_weights", "gaussian"),
+                target_modules=normalized_config["target_modules"],
+                lora_dropout=float(normalized_config.get("dropout", 0.0)),
+                bias=normalized_config.get("bias", "none"),
+            )
+            transformer = get_peft_model(base_transformer, lora_cfg)
+
+        self._mark_only_lora_trainable(transformer)
+        transformer.train()
+        self.agent_model.transformer = transformer
+
+        lora_scale = normalized_config.get("scale")
+        if lora_scale is not None:
+            try:
+                scale_lora_layers(transformer, float(lora_scale))
+                self._lora_scale = float(lora_scale)
+            except Exception as exc:  # pragma: no cover - safety net
+                logger.warning("Failed to apply LoRA scaling (scale=%s): %s", lora_scale, exc)
+
+        self.lora_trainable_parameter_names = [
+            name for name, param in transformer.named_parameters() if param.requires_grad
+        ]
+        trainable_param_count = sum(param.numel() for _, param in transformer.named_parameters() if param.requires_grad)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "LoRA enabled for SD3 transformer with %d trainable parameters (rank=%s, alpha=%s, adapter=%s).",
+                trainable_param_count,
+                normalized_config["r"],
+                normalized_config["alpha"],
+                normalized_config.get("adapter_name", "default"),
+            )
+
+        # Persist the final configuration for downstream inspection/debugging.
+        self.lora_config = normalized_config
+
+    @staticmethod
+    def _mark_only_lora_trainable(module: nn.Module) -> None:
+        """Freeze base weights and leave only LoRA adapter parameters trainable."""
+
+        for name, param in module.named_parameters():
+            lower_name = name.lower()
+            if any(tag in lower_name for tag in {"lora_a", "lora_b", "lora_embedding"}):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    def _load_time_predictor_checkpoint(self) -> None:
+        """Optionally load a separate time predictor checkpoint if provided."""
+
+        path = self.time_predictor_path
+        if not path:
+            return
+
+        candidate: Optional[str] = None
+        expanded = os.path.expanduser(path)
+        if os.path.isfile(expanded):
+            candidate = expanded
+        elif os.path.isdir(expanded):
+            patterns = ["*.safetensors", "*.bin", "*.pt", "*.ckpt"]
+            files: List[str] = []
+            for pattern in patterns:
+                files.extend(sorted(glob.glob(os.path.join(expanded, pattern))))
+            if files:
+                candidate = files[0]
+        else:
+            logger.warning("Provided time predictor path %s does not exist; skipping load.", path)
+            return
+
+        if candidate is None:
+            logger.warning(
+                "No checkpoint files found under %s for time predictor; expected extensions: %s",
+                expanded,
+                [".safetensors", ".bin", ".pt", ".ckpt"],
+            )
+            return
+
+        try:
+            load_time_predictor(self.agent_model, candidate)
+            logger.info("Loaded time predictor weights from %s", candidate)
+        except Exception as exc:
+            logger.error("Failed to load time predictor weights from %s: %s", candidate, exc)
+            raise
 
     def encode_prompt(self, *args, **kwargs):
         """Delegate prompt encoding to the inner agent_model.
