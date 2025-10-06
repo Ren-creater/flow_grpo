@@ -1,5 +1,6 @@
 # import
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -17,8 +18,10 @@ class PickScoreModel(nn.Module):
     ):
         super(PickScoreModel, self).__init__()
         self.device = device
-        self.processor = AutoProcessor.from_pretrained(processor_name_or_path)
-        self.model = AutoModel.from_pretrained(model_pretrained_name_or_path).eval().to(device)
+        proc_path = os.path.expanduser(processor_name_or_path)
+        model_path = os.path.expanduser(model_pretrained_name_or_path)
+        self.processor = AutoProcessor.from_pretrained(proc_path)
+        self.model = AutoModel.from_pretrained(model_path).eval().to(device)
         self.eval()
 
     def _prepare_prompts(self, prompt: Union[str, Sequence[str]], num_images: int) -> List[str]:

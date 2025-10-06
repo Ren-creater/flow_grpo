@@ -1,0 +1,4 @@
+_target_: src.data.text_dataset.PlainTextDataset
+data_path: ~/flow_grpo/dataset/caption_exports/all_captions.txt
+max_lines: null
+strip_after_comma: false

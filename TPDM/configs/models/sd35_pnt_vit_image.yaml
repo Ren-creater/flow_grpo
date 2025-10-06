@@ -2,18 +2,19 @@ _target_: src.models.stable_diffusion_3.modeling_sd3_pnt.SD3PredictNextTimeStepM
 pretrained_model_name_or_path: ~/flow_grpo/stable-diffusion-3.5-medium
 use_vit_predictor: true
 time_predictor_config:
-  num_layers: 8
-  num_heads: 12
-  hidden_size: 768
+  num_layers: 6
+  num_heads: 8
+  hidden_size: 512
   mlp_ratio: 4.0
   dropout: 0.1
   attention_dropout: 0.1
-  image_size: 32
-  patch_size: 8
-  in_channels: 3072  # Combined hidden states channels (may need adjustment for SD3.5)
-  text_embed_dim: 4096  # Text embedding dimension (may need adjustment for SD3.5)
-  timestep_embed_dim: 1536  # Timestep embedding dimension
+  image_size: 256
+  patch_size: 16
+  in_channels: 3
+  text_embed_dim: 4096
+  timestep_embed_dim: 1536
   projection_dim: 2
+  input_type: decoded_image
   init_alpha: 2.0
   init_beta: 1.0
   epsilon: 1.0

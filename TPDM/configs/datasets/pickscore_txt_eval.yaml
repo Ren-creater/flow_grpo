@@ -1,0 +1,4 @@
+_target_: src.data.text_dataset.PlainTextDataset
+data_path: ~/flow_grpo/dataset/pickscore/test.txt
+max_lines: null
+strip_after_comma: true

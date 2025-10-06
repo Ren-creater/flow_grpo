@@ -1,0 +1,44 @@
+_target_: src.models.stable_diffusion_3.modeling_sd3_pnt.SD3PredictNextTimeStepModelRLOOWrapper
+pretrained_model_name_or_path: ~/flow_grpo/stable-diffusion-3.5-medium
+use_vit_predictor: true
+use_lora: true
+lora_config:
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  init_lora_weights: gaussian
+  adapter_name: default
+  target_modules:
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+  bias: none
+  scale: null
+  path: null
+  enabled: true
+time_predictor_path: null
+time_predictor_config:
+  num_layers: 6
+  num_heads: 8
+  hidden_size: 512
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attention_dropout: 0.1
+  image_size: 256
+  patch_size: 16
+  in_channels: 3
+  text_embed_dim: 4096
+  timestep_embed_dim: 1536
+  projection_dim: 2
+  input_type: decoded_image
+  init_alpha: 2.0
+  init_beta: 1.0
+  epsilon: 1.0
+  use_text_conditioning: true
+  use_timestep_conditioning: true
+  cross_attention: true

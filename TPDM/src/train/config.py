@@ -11,6 +11,7 @@ class ConfigPathArguments:
     model_config: Optional[str] = field(default=None, metadata={"help": "config path of model"})
     reward_model_config: Optional[str] = field(default=None, metadata={"help": "config path of reward model"})
     train_dataset: Optional[str] = field(default=None, metadata={"help": "config path of training dataset"})
+    eval_dataset: Optional[str] = field(default=None, metadata={"help": "config path of evaluation dataset"})
     data_collator: Optional[str] = field(default=None, metadata={"help": "config path of data collator"})
 
 
@@ -22,4 +23,5 @@ class CustomRLOOConfig(RLOOConfig):
     init_beta: float = 0.5
     relative: bool = True
     prediction_type: str = "alpha_beta"
-    max_inference_steps: int = 40#28
+    max_inference_steps: int = 50#28
+    evaluation_strategy: str = "steps"

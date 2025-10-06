@@ -39,6 +39,12 @@ def train(cfg, training_args):
     logger.info(f"reward model loaded from {cfg.reward_model_config}")
     train_dataset = hydra.utils.instantiate(OmegaConf.load(cfg.train_dataset))
     logger.info(f"train dataset loaded from {cfg.train_dataset}")
+    eval_dataset = train_dataset
+    if cfg.eval_dataset is not None:
+        eval_dataset = hydra.utils.instantiate(OmegaConf.load(cfg.eval_dataset))
+        logger.info(f"eval dataset loaded from {cfg.eval_dataset}")
+    else:
+        logger.info("eval dataset not provided; defaulting to train dataset")
     data_collator = hydra.utils.instantiate(OmegaConf.load(cfg.data_collator))
     logger.info(f"data collator loaded from {cfg.data_collator}")
 
@@ -49,7 +55,7 @@ def train(cfg, training_args):
         reward_model=reward_model,
         data_collator=data_collator,
         train_dataset=train_dataset,
-        eval_dataset=train_dataset,
+        eval_dataset=eval_dataset,
     )
 
     if "wandb" in training_args.report_to:

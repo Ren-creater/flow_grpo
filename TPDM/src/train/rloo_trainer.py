@@ -203,6 +203,53 @@ class CommonRLOOTrainer(RLOOTrainer):
         else:
             self.reward_model = self.reward_model.to(self.accelerator.device)
 
+    def _maybe_compute_prompt_embeddings(self, data):
+        model = self.model
+        if not hasattr(model, "use_vit_predictor") or not getattr(model, "use_vit_predictor", False):
+            return data
+
+        prompt_list = data.get("prompt", None)
+        if not prompt_list:
+            return data
+
+        try:
+            with torch.no_grad():
+                (
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    pooled_prompt_embeds,
+                    negative_pooled_prompt_embeds,
+                ) = model.encode_prompt(
+                    prompt=prompt_list,
+                    device=getattr(model, "_execution_device", None),
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                )
+
+            try:
+                tgt_device = getattr(model, "_execution_device", None)
+                if tgt_device is None:
+                    tgt_device = self.accelerator.device
+                tgt_dtype = next(model.parameters()).dtype
+                prompt_embeds = prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
+                negative_prompt_embeds = negative_prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(device=tgt_device)
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=tgt_device)
+            except Exception:
+                prompt_embeds = prompt_embeds.to(device=self.accelerator.device)
+                negative_prompt_embeds = negative_prompt_embeds.to(device=self.accelerator.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(device=self.accelerator.device)
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=self.accelerator.device)
+
+            data["prompt_embeds"] = prompt_embeds
+            data["negative_prompt_embeds"] = negative_prompt_embeds
+            data["pooled_prompt_embeds"] = pooled_prompt_embeds
+            data["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+        except Exception as exc:
+            logger.warning(f"Failed to compute prompt embeddings for ViT predictor: {exc}")
+
+        return data
+
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -272,6 +319,82 @@ class CommonRLOOTrainer(RLOOTrainer):
                 self._eval_dataloaders = {dataloader_key: eval_dataloader}
 
         return eval_dataloader
+
+    def _run_eval_pass(self):
+        if self.eval_dataloader is None:
+            return None
+
+        accelerator = self.accelerator
+        model = self.model
+        reward_model = self.reward_model
+        was_training = model.training
+
+        total_reward = torch.tensor(0.0, device=accelerator.device)
+        total_last_reward = torch.tensor(0.0, device=accelerator.device)
+        total_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
+
+        accelerator.wait_for_everyone()
+        model.eval()
+
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = dict(batch)
+                batch = self._maybe_compute_prompt_embeddings(batch)
+                outputs = model.sample(batch)
+                rewards, last_rewards = model.reward(
+                    batch,
+                    outputs,
+                    reward_model,
+                    gamma=self.args.gamma,
+                    return_last_reward=True,
+                )
+
+                if not isinstance(rewards, torch.Tensor):
+                    rewards_tensor = torch.tensor(rewards, device=accelerator.device, dtype=torch.float32)
+                else:
+                    rewards_tensor = rewards.to(device=accelerator.device, dtype=torch.float32)
+
+                if not isinstance(last_rewards, torch.Tensor):
+                    last_rewards_tensor = torch.tensor(last_rewards, device=accelerator.device, dtype=torch.float32)
+                else:
+                    last_rewards_tensor = last_rewards.to(device=accelerator.device, dtype=torch.float32)
+
+                total_reward += rewards_tensor.sum()
+                total_last_reward += last_rewards_tensor.sum()
+                total_count += torch.tensor(rewards_tensor.numel(), device=accelerator.device, dtype=torch.long)
+
+                del outputs, rewards_tensor, last_rewards_tensor
+
+        if was_training:
+            model.train()
+
+        gathered_reward = accelerator.gather(total_reward).sum()
+        gathered_last_reward = accelerator.gather(total_last_reward).sum()
+        gathered_count = accelerator.gather(total_count).sum()
+        accelerator.wait_for_everyone()
+
+        count_value = int(gathered_count.item())
+        metrics = {"eval/num_samples": count_value}
+        if count_value > 0:
+            avg_reward = (gathered_reward.float() / gathered_count.float()).item()
+            avg_last_reward = (gathered_last_reward.float() / gathered_count.float()).item()
+        else:
+            avg_reward = 0.0
+            avg_last_reward = 0.0
+
+        metrics["eval/avg_reward"] = avg_reward
+        metrics["eval/avg_last_reward"] = avg_last_reward
+
+        if accelerator.is_main_process:
+            logger.info(
+                "Eval metrics at step %s -- avg_reward: %.6f, avg_last_reward: %.6f over %d samples",
+                self.state.global_step,
+                avg_reward,
+                avg_last_reward,
+                count_value,
+            )
+
+        return metrics
 
     def train(
         self,
@@ -427,48 +550,7 @@ class CommonRLOOTrainer(RLOOTrainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
-                # If the policy uses the ViT time predictor, ensure we provide
-                # text embeddings to the model so `only_predict_logprobs` can
-                # consume them during logprob recomputation. Compute embeddings
-                # here and attach to the data dict before repeating for rloo_k.
-                if hasattr(model, "use_vit_predictor") and model.use_vit_predictor:
-                    # model.encode_prompt returns (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
-                    try:
-                        # The data['prompt'] is expected to be a list of strings
-                        prompt_list = data.get("prompt", None)
-                        if prompt_list is not None:
-                            # compute embeddings WITH classifier free guidance negatives so both
-                            # positive and negative embeddings are available for CFG and ViT
-                            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = model.encode_prompt(
-                                prompt=prompt_list,
-                                device=model._execution_device if hasattr(model, "_execution_device") else None,
-                                num_images_per_prompt=1,
-                                do_classifier_free_guidance=True,
-                            )
-
-                            # ensure tensors are on the model device and align dtype where possible
-                            try:
-                                tgt_device = model._execution_device if hasattr(model, "_execution_device") else self.accelerator.device
-                                tgt_dtype = next(model.parameters()).dtype
-                                prompt_embeds = prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
-                                negative_prompt_embeds = negative_prompt_embeds.to(device=tgt_device, dtype=tgt_dtype)
-                                pooled_prompt_embeds = pooled_prompt_embeds.to(device=tgt_device)
-                                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=tgt_device)
-                            except Exception:
-                                # fallback: put on accelerator device without dtype cast
-                                prompt_embeds = prompt_embeds.to(device=self.accelerator.device)
-                                negative_prompt_embeds = negative_prompt_embeds.to(device=self.accelerator.device)
-                                pooled_prompt_embeds = pooled_prompt_embeds.to(device=self.accelerator.device)
-                                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device=self.accelerator.device)
-
-                            # attach to data so model.logprobs / compute_time_predictor_* can use them
-                            data["prompt_embeds"] = prompt_embeds
-                            data["negative_prompt_embeds"] = negative_prompt_embeds
-                            data["pooled_prompt_embeds"] = pooled_prompt_embeds
-                            data["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
-                    except Exception as e:
-                        logger.warning(f"Failed to compute prompt embeddings for ViT predictor: {e}")
-
+                data = self._maybe_compute_prompt_embeddings(data)
                 # expand the data by the number of rloo_k
                 data = model.rloo_repeat(data, args.rloo_k)
                 outputs = model.sample(data)
@@ -636,6 +718,15 @@ class CommonRLOOTrainer(RLOOTrainer):
             self.lr_scheduler.step()
             self.state.global_step += 1
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+
+            if self.control.should_evaluate:
+                eval_metrics = self._run_eval_pass()
+                if eval_metrics is not None:
+                    self.log(eval_metrics)
+                else:
+                    eval_metrics = {}
+                self.control = self.callback_handler.on_evaluate(args, self.state, self.control, eval_metrics)
+
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None, metrics=metrics)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
