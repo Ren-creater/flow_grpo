@@ -586,7 +586,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sample_neg_pooled_prompt_embeds = sample_neg_pooled_prompt_embeds[:len(prompt_embeds)]
         with autocast():
             with torch.no_grad():
-                images, _, _, _, _, _, _, _, _, _ = pipeline_with_logprob(
+                images, _, _, _, _, _, _, _, _, _, _ = pipeline_with_logprob(
                     pipeline,
                     prompt_embeds=prompt_embeds,
                     pooled_prompt_embeds=pooled_prompt_embeds,
@@ -1196,7 +1196,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, time_predictor_log_probs, timesteps, sigma_max, all_sigmas_per_step, hidden_states_combineds, tembs, all_active_masks = pipeline_with_logprob(
+                    images, latents, log_probs, time_predictor_log_probs, timesteps, sigma_max, all_sigmas_per_step, hidden_states_combineds, tembs, step_counts, all_active_masks = pipeline_with_logprob(
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
@@ -1251,6 +1251,7 @@ def main(_):
                     "rewards": rewards,
                     "sigmas": sigmas,  # sigma values for each timestep (needs num_steps + 1 for next_sigma access)
                     "sigma_max": sigma_max,
+                    "step_counts": step_counts,
                     "active_masks": all_active_masks,
                 }
             )
@@ -1369,6 +1370,16 @@ def main(_):
             }
             for k in samples[0].keys()
         }
+
+        # Log average active denoising steps per sample
+        step_counts_tensor = samples["step_counts"].to(accelerator.device, dtype=torch.float32)
+        gathered_step_counts = accelerator.gather(step_counts_tensor)
+        if accelerator.is_main_process:
+            wandb.log(
+                {"avg_active_steps": gathered_step_counts.mean().item()},
+                step=global_step,
+            )
+        del samples["step_counts"]
 
         if epoch % 10 == 0 and accelerator.is_main_process:
             # this is a hack to force wandb to log the images as JPEGs instead of PNGs
@@ -1637,7 +1648,8 @@ def main(_):
 
                         # Create mask for active samples at this timestep (use per_step_active_mask)
                         # per_step_active_mask is a boolean tensor, convert to float for calculations
-                        active_mask_float = per_step_active_mask.float()  # Shape: (batch_size,)
+                        #active_mask_float = per_step_active_mask.float()  # Shape: (batch_size,)
+                        active_mask_float = torch.ones_like(per_step_active_mask, dtype=torch.float)
                         
                         # Combine logprobs: diffusion logprobs + time predictor logprobs
                         if is_time_predictor_only_phase:

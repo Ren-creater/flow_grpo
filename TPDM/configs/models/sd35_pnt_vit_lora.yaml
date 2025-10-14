@@ -21,7 +21,7 @@ lora_config:
   scale: null
   path: ~/flow_grpo/SD3.5M-FlowGRPO-PickScore
   enabled: true
-time_predictor_path: ~/flow_grpo/TPDM/outputs/2025-10-01/sd35_vit_captions_20251001_192616/checkpoint-300/model.safetensors
+time_predictor_path: ~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors
 time_predictor_config:
   num_layers: 8
   num_heads: 12

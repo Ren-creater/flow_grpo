@@ -25,3 +25,7 @@ class CustomRLOOConfig(RLOOConfig):
     prediction_type: str = "alpha_beta"
     max_inference_steps: int = 50#28
     evaluation_strategy: str = "steps"
+    # Whether to run the in-training evaluation passes (calls to _run_eval_pass()).
+    # Default True to preserve existing behavior; set to False to completely disable
+    # periodic evaluation and the associated callbacks (wandb image logging, etc.).
+    enable_eval: bool = True

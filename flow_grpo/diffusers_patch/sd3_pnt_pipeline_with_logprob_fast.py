@@ -137,7 +137,7 @@ def pipeline_with_logprob(
 
     random.seed(process_index)
     if random_timestep is None:
-        random_timestep = random.randint(0, sample_num_steps//2)
+        random_timestep = random.randint(0, sample_num_steps//random.randint(2,4))
 
     # 6. Prepare image embeddings
     all_latents = []
@@ -148,6 +148,13 @@ def pipeline_with_logprob(
     all_tembs = []
     all_sigmas_per_step = []
     all_active_masks = []
+
+    # Track which samples remain active and how many denoising steps each one performs
+    active_mask = torch.ones_like(sigma, dtype=torch.bool, device=device)
+    step_counts = torch.zeros_like(sigma, dtype=torch.float32, device=device)
+
+    # Force samples to stay active (at least at min_sigma) for the early portion of the training window
+    force_active_until_step = min(num_inference_steps, random_timestep + train_num_steps)
     
     # Clear and initialize scheduler for batched timesteps/sigmas
     self.scheduler.timesteps = []
@@ -163,6 +170,9 @@ def pipeline_with_logprob(
         if self.interrupt:
             continue
 
+        # Count the number of denoising iterations performed by each still-active sample
+        step_counts += active_mask.float()
+
         # Determine noise level based on step position
         if step < random_timestep:
             cur_noise_level = 0
@@ -177,13 +187,10 @@ def pipeline_with_logprob(
             if self.do_classifier_free_guidance:
                 tem_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
                 tem_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-            # Update sigma to match new batch size
-                sigma = sigma.repeat(mini_num_image_per_prompt)
-                # Also repeat active_mask when repeating latents
-                if 'active_mask' in locals():
-                    active_mask = active_mask.repeat(mini_num_image_per_prompt)
-                else:
-                    active_mask = torch.ones_like(sigma, dtype=torch.bool)
+            # Update sigma, active mask, and step counts to match new batch size
+            sigma = sigma.repeat(mini_num_image_per_prompt)
+            active_mask = active_mask.repeat(mini_num_image_per_prompt)
+            step_counts = step_counts.repeat(mini_num_image_per_prompt)
             # Update scheduler sigmas to repeat previous sigmas
             self.scheduler.sigmas = [s.repeat(mini_num_image_per_prompt) for s in self.scheduler.sigmas]
             # Update scheduler for new batch size
@@ -269,12 +276,12 @@ def pipeline_with_logprob(
             
             # Check if this sample should stop
             if sigma[i] < self.min_sigma or sigma_next[i] < self.min_sigma:
-                sigma_next[i] = torch.tensor(0.0).to(sigma_next.device)
-                # Mark as inactive for next steps
-                if 'active_mask' in locals():
-                    active_mask[i] = False
+                force_keep_active = step < force_active_until_step
+                if force_keep_active:
+                    sigma_next[i] = torch.as_tensor(self.min_sigma, device=sigma_next.device, dtype=sigma_next.dtype)
+                    active_mask[i] = True
                 else:
-                    active_mask = torch.ones_like(sigma, dtype=torch.bool)
+                    sigma_next[i] = torch.zeros((), device=sigma_next.device, dtype=sigma_next.dtype)
                     active_mask[i] = False
 
     # Update scheduler state for this timestep
@@ -287,8 +294,6 @@ def pipeline_with_logprob(
         latents_dtype = latents.dtype
 
         # Apply SDE step to all samples, passing active_mask for safety
-        if 'active_mask' not in locals():
-            active_mask = torch.ones(len(latents), dtype=torch.bool, device=latents.device)
         latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
             self.scheduler, 
             noise_pred.float(), 
@@ -350,5 +355,6 @@ def pipeline_with_logprob(
         all_sigmas_per_step,
         all_hidden_states_combineds,
         all_tembs,
+        step_counts.detach().cpu(),
         all_active_masks,
     )

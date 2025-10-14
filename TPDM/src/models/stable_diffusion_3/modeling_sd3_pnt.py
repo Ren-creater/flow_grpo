@@ -705,12 +705,18 @@ class SD3PredictNextTimeStepModel(nn.Module):
     ):
         super(SD3PredictNextTimeStepModel, self).__init__()
 
-        # initialize the models
+        # resolve any user/home shortcuts or environment variables in the path
+        try:
+            resolved_pretrained = os.path.expandvars(os.path.expanduser(pretrained_model_name_or_path))
+        except Exception:
+            resolved_pretrained = pretrained_model_name_or_path
+
+        # initialize the models (use resolved path if it points to a local directory)
         self.vae = AutoencoderKL.from_pretrained(
-            pretrained_model_name_or_path, subfolder="vae", torch_dtype=torch_dtype
+            resolved_pretrained, subfolder="vae", torch_dtype=torch_dtype
         )
         self.transformer = CustomSD3Transformer2DModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype
+            resolved_pretrained, subfolder="transformer", torch_dtype=torch_dtype
         )
 
         # Initialize TimePredictor (CNN or ViT based)
@@ -756,26 +762,27 @@ class SD3PredictNextTimeStepModel(nn.Module):
                         self.time_predictor_image_size = None
             self.uses_image_time_predictor = self.time_predictor_input_type == "decoded_image"
         self.scheduler = CustomFlowMatchEulerDiscreteScheduler.from_pretrained(
-            pretrained_model_name_or_path, subfolder="scheduler"
+            resolved_pretrained, subfolder="scheduler"
         )
 
         if not pre_process:
+            # Use the resolved path (expanded ~ and env vars) so HF doesn't try to treat it as a hub repo id
             self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=torch_dtype
+                resolved_pretrained, subfolder="text_encoder", torch_dtype=torch_dtype
             ).eval()
             self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=torch_dtype
+                resolved_pretrained, subfolder="text_encoder_2", torch_dtype=torch_dtype
             ).eval()
             self.text_encoder_3 = (
                 T5EncoderModel.from_pretrained(
-                    pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=torch_dtype
+                    resolved_pretrained, subfolder="text_encoder_3", torch_dtype=torch_dtype
                 )
                 .to(dtype=self.vae.dtype)
                 .eval()
             )
-            self.tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
-            self.tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
-            self.tokenizer_3 = T5TokenizerFast.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_3")
+            self.tokenizer = CLIPTokenizer.from_pretrained(resolved_pretrained, subfolder="tokenizer")
+            self.tokenizer_2 = CLIPTokenizer.from_pretrained(resolved_pretrained, subfolder="tokenizer_2")
+            self.tokenizer_3 = T5TokenizerFast.from_pretrained(resolved_pretrained, subfolder="tokenizer_3")
 
         self.pre_process = pre_process
         self.vae_scale_factor = (

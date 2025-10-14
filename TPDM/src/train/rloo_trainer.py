@@ -691,23 +691,28 @@ class CommonRLOOTrainer(RLOOTrainer):
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics["eps"] = eps
-                metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
+                # Ensure all gathered tensors are float32 to avoid dtype mismatches across ranks
+                metrics["objective/kl"] = self.accelerator.gather(mean_kl.to(dtype=torch.float32)).mean().item()
                 # metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
-                metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
-                metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
-                metrics["objective/scores"] = self.accelerator.gather(scores.mean()).mean().item()
+                metrics["objective/non_score_reward"] = self.accelerator.gather(
+                    mean_non_score_reward.to(dtype=torch.float32)
+                ).mean().item()
+                metrics["objective/rlhf_reward"] = self.accelerator.gather(
+                    rlhf_reward.to(dtype=torch.float32)
+                ).mean().item()
+                metrics["objective/scores"] = self.accelerator.gather(scores.mean().to(dtype=torch.float32)).mean().item()
                 metrics["objective/last_image_scores"] = (
-                    self.accelerator.gather(last_image_scores.mean()).mean().item()
+                    self.accelerator.gather(last_image_scores.mean().to(dtype=torch.float32)).mean().item()
                 )
-                metrics["policy/approxkl_avg"] = self.accelerator.gather(approxkl_stats).mean().item()
-                metrics["policy/clipfrac_avg"] = self.accelerator.gather(pg_clipfrac_stats).mean().item()
-                metrics["policy/steps_avg"] = self.accelerator.gather(sample_steps_stats).mean().item()
-                metrics["policy/grad_norm_avg"] = self.accelerator.gather(grad_norm).mean().item()
-                metrics["loss/policy_avg"] = self.accelerator.gather(pg_loss_stats).mean().item()
+                metrics["policy/approxkl_avg"] = self.accelerator.gather(approxkl_stats.to(dtype=torch.float32)).mean().item()
+                metrics["policy/clipfrac_avg"] = self.accelerator.gather(pg_clipfrac_stats.to(dtype=torch.float32)).mean().item()
+                metrics["policy/steps_avg"] = self.accelerator.gather(sample_steps_stats.to(dtype=torch.float32)).mean().item()
+                metrics["policy/grad_norm_avg"] = self.accelerator.gather(grad_norm.to(dtype=torch.float32)).mean().item()
+                metrics["loss/policy_avg"] = self.accelerator.gather(pg_loss_stats.to(dtype=torch.float32)).mean().item()
                 # metrics["val/clipfrac_avg"] = self.accelerator.gather(vf_clipfrac_stats).mean().item()
-                metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
-                metrics["val/ratio"] = self.accelerator.gather(ratio_stats).mean().item()
-                metrics["val/ratio_var"] = self.accelerator.gather(ratio_stats).var().item()
+                metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats.to(dtype=torch.float32)).mean().item()
+                metrics["val/ratio"] = self.accelerator.gather(ratio_stats.to(dtype=torch.float32)).mean().item()
+                metrics["val/ratio_var"] = self.accelerator.gather(ratio_stats.to(dtype=torch.float32)).var().item()
                 # metrics["val/num_eos_tokens"] = (responses == tokenizer.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
@@ -719,7 +724,9 @@ class CommonRLOOTrainer(RLOOTrainer):
             self.state.global_step += 1
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-            if self.control.should_evaluate:
+            # Periodic evaluation: only run if TrainerControl requests it AND the
+            # user has not disabled evaluation via config (args.enable_eval).
+            if self.control.should_evaluate and getattr(self.args, "enable_eval", True):
                 eval_metrics = self._run_eval_pass()
                 if eval_metrics is not None:
                     self.log(eval_metrics)
