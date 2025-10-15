@@ -1333,6 +1333,24 @@ def pickscore_sd3_5_pnt_maxE_fast_2gpu():
     config.train.time_predictor_only_epochs = 60
     return config
 
+def pickscore_sd3_5_pnt_vit_fast_2gpu_t():
+    config = pickscore_sd3_fast_2gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
+    config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit.yaml")
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 10
+
+    return config
+
 def pickscore_sd3_5_pnt_vit_fast_2gpu():
     config = pickscore_sd3_fast_2gpu()
     config.sample.num_steps = 50
@@ -1348,6 +1366,25 @@ def pickscore_sd3_5_pnt_vit_fast_2gpu():
     config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
     config.use_vit_predictor=True # Whether to use ViT-based time predictor
     config.train.time_predictor_only_epochs = 0
+
+    return config
+
+def pickscore_sd3_5_pnt_vit_fast_2gpu_frozen():
+    config = pickscore_sd3_fast_2gpu()
+    config.sample.num_steps = 50
+    config.sample.eval_num_steps = 50
+    # sd3.5 medium - local path
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
+    config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
+    config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit.yaml")
+
+    # Add time predictor checkpoint path for resuming
+    config.time_predictor_checkpoint = None  # Set to path if resuming from checkpoint
+    config.use_vit_predictor=True # Whether to use ViT-based time predictor
+    config.train.time_predictor_only_epochs = 0
+    config.train.freeze_time_predictor = True
 
     return config
 

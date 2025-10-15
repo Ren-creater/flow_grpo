@@ -710,6 +710,13 @@ def main(_):
 
     # Check if we need special DDP handling for time_predictor-only training
     time_predictor_only_epochs = getattr(config.train, 'time_predictor_only_epochs', 0)
+    freeze_time_predictor = getattr(config.train, "freeze_time_predictor", False)
+    if freeze_time_predictor and time_predictor_only_epochs > 0:
+        logger.warning(
+            "freeze_time_predictor=True detected; overriding time_predictor_only_epochs to 0"
+        )
+        config.train.time_predictor_only_epochs = 0
+        time_predictor_only_epochs = 0
     
     # Prepare kwargs for Accelerator initialization
     accelerator_kwargs = {
@@ -811,7 +818,9 @@ def main(_):
     pipeline.text_encoder_2.requires_grad_(False)
     pipeline.text_encoder_3.requires_grad_(False)
     pipeline.transformer.requires_grad_(not config.use_lora)
-    pipeline.time_predictor.requires_grad_(True)
+    pipeline.time_predictor.requires_grad_(not freeze_time_predictor)
+    if freeze_time_predictor:
+        logger.info("Time predictor freezing enabled; gradients are disabled.")
 
     # Freeze VAE and text encoders if needed, and set up LoRA as before
     text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]
@@ -866,7 +875,7 @@ def main(_):
     
     transformer = pipeline.transformer
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    time_predictor_parameters = list(pipeline.time_predictor.parameters())
+    time_predictor_parameters = [p for p in pipeline.time_predictor.parameters() if p.requires_grad]
     all_trainable_parameters = transformer_trainable_parameters + time_predictor_parameters
     # This ema setting affects the previous 2 × 8 = 160 steps on average.
     ema = EMAModuleWrapper(all_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
@@ -1111,7 +1120,7 @@ def main(_):
 
     while True:
         # Handle time_predictor-only training phase
-        time_predictor_only_epochs = config.train.time_predictor_only_epochs
+        time_predictor_only_epochs = 0 if freeze_time_predictor else config.train.time_predictor_only_epochs
         is_time_predictor_only_phase = epoch < time_predictor_only_epochs
         
         # Switch from time_predictor-only to full training if needed
@@ -1628,23 +1637,28 @@ def main(_):
                                 std_dev_t = None
                                 prev_sample_mean_ref = None
                             
-                            # Always compute time predictor logprobs (this is what we're training)
-                            time_predictor_log_prob = compute_time_predictor_log_prob(
-                                pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
-                            )
-                            
-                            # Check for NaN/Inf in individual components before combining
+                            if freeze_time_predictor:
+                                time_predictor_log_prob = torch.zeros_like(sample["log_probs"][:, j])
+                                time_predictor_kl_div = None
+                            else:
+                                # Always compute time predictor logprobs when the predictor is trainable
+                                time_predictor_log_prob = compute_time_predictor_log_prob(
+                                    pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                                )
+
+                                # Check for NaN/Inf in time predictor component before combining
+                                if torch.isnan(time_predictor_log_prob).any() or torch.isinf(time_predictor_log_prob).any():
+                                    logger.warning(f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}")
+                                    logger.warning(f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}")
+
+                                # Compute time predictor KL divergence for regularization
+                                time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
+
+                            # Check for NaN/Inf in diffusion component before combining
                             if not is_time_predictor_only_phase:
                                 if torch.isnan(diffusion_log_prob).any() or torch.isinf(diffusion_log_prob).any():
                                     logger.warning(f"NaN/Inf detected in diffusion_log_prob component: {diffusion_log_prob}")
                                     logger.warning(f"diffusion_log_prob stats: min={diffusion_log_prob.min()}, max={diffusion_log_prob.max()}, mean={diffusion_log_prob.mean()}")
-                            
-                            if torch.isnan(time_predictor_log_prob).any() or torch.isinf(time_predictor_log_prob).any():
-                                logger.warning(f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}")
-                                logger.warning(f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}")
-                            
-                            # Compute time predictor KL divergence for regularization
-                            time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
 
                         # Create mask for active samples at this timestep (use per_step_active_mask)
                         # per_step_active_mask is a boolean tensor, convert to float for calculations
@@ -1662,6 +1676,18 @@ def main(_):
                             if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
                                 logger.warning(f"NaN/Inf detected in reference time_predictor_log_probs: {reference_log_prob}")
                                 logger.warning(f"reference time_predictor_log_probs stats: min={reference_log_prob.min()}, max={reference_log_prob.max()}, mean={reference_log_prob.mean()}")
+                        elif freeze_time_predictor:
+                            # With a frozen time predictor we only optimize the diffusion policy
+                            current_log_prob = diffusion_log_prob
+                            reference_log_prob = sample["log_probs"][:, j]
+
+                            if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
+                                logger.warning(
+                                    f"NaN/Inf detected in reference diffusion log_probs: {sample['log_probs'][:, j]}"
+                                )
+                                logger.warning(
+                                    f"reference diffusion log_probs stats: min={sample['log_probs'][:, j].min()}, max={sample['log_probs'][:, j].max()}, mean={sample['log_probs'][:, j].mean()}"
+                                )
                         else:
                             # In joint training: combine both logprobs
                             current_log_prob = diffusion_log_prob + time_predictor_log_prob
@@ -1736,7 +1762,11 @@ def main(_):
                         # Configuration: Set config.train.time_predictor_kl_weight = 0.01 (or desired value) 
                         # to control the strength of time predictor KL regularization
                         time_predictor_kl_weight = getattr(config.train, 'time_predictor_kl_weight', 0.0)  # Default weight
-                        if time_predictor_kl_weight > 0:
+                        if (
+                            time_predictor_kl_weight > 0
+                            and not freeze_time_predictor
+                            and time_predictor_kl_div is not None
+                        ):
                             time_predictor_kl_sample_losses = time_predictor_kl_div * active_mask_float
                             time_predictor_kl_loss = torch.mean(time_predictor_kl_sample_losses / num_train_steps)
                             
@@ -1772,7 +1802,11 @@ def main(_):
                             info["diffusion_kl_loss"].append(diffusion_kl_loss)
                         
                         # Always log time predictor KL loss when weight > 0
-                        if time_predictor_kl_weight > 0:
+                        if (
+                            time_predictor_kl_weight > 0
+                            and not freeze_time_predictor
+                            and time_predictor_kl_div is not None
+                        ):
                             info["time_predictor_kl_loss"].append(time_predictor_kl_loss)
                             info["time_predictor_kl_div_mean"].append(time_predictor_kl_div.mean())
                             info["time_predictor_kl_div_max"].append(time_predictor_kl_div.max())
@@ -1780,7 +1814,8 @@ def main(_):
                         # Track separate logprob components for debugging
                         if not is_time_predictor_only_phase:
                             info["diffusion_log_prob_mean"].append(diffusion_log_prob.mean())
-                        info["time_predictor_log_prob_mean"].append(time_predictor_log_prob.mean())
+                        if not freeze_time_predictor:
+                            info["time_predictor_log_prob_mean"].append(time_predictor_log_prob.mean())
                         info["combined_log_prob_mean"].append(current_log_prob.mean())
 
                         info["loss"].append(loss)
@@ -1820,7 +1855,8 @@ def main(_):
                         processed_info.update({
                             "epoch": epoch, 
                             "inner_epoch": inner_epoch,
-                            "time_predictor_only_phase": is_time_predictor_only_phase
+                            "time_predictor_only_phase": is_time_predictor_only_phase,
+                            "time_predictor_frozen": freeze_time_predictor,
                         })
                         if accelerator.is_main_process:
                             wandb.log(processed_info, step=global_step)

@@ -101,6 +101,8 @@ def get_config():
     train.lora_path = None
     # save ema model
     train.ema = False
+    # whether to keep the time predictor frozen during training
+    train.freeze_time_predictor = False
     # number of epochs to train only the time_predictor (keep rest of model frozen)
     # This is useful for warm-starting the time_predictor before joint training.
     # During these epochs, only time_predictor parameters are updated while transformer stays frozen.
@@ -124,7 +126,7 @@ def get_config():
     # When < 1.0, earlier timesteps get lower rewards: reward_t = final_reward * gamma^(last_timestep - t)
     # When = 1.0, all timesteps get the same reward (original behavior)
     # During joint training, gamma discounting is disabled and uniform rewards are used
-    config.reward_gamma = 0.9
+    config.reward_gamma = 1.0
     config.save_dir = ''
 
     ###### Per-Prompt Stat Tracking ######
