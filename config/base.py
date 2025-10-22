@@ -31,6 +31,8 @@ def get_config():
     config.use_image_time_predictor = False
     config.time_predictor_config_path = None
     config.time_predictor_image_size = None
+    config.activation_checkpointing = False
+    config.fsdp_optimizer_offload = False
 
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
@@ -47,6 +49,8 @@ def get_config():
     sample.eval_num_steps = 40
     # classifier-free guidance weight. 1.0 is no guidance.
     sample.guidance_scale = 4.5
+    # classifier-free guidance weight for evaluation. 1.0 is no guidance.
+    sample.eval_guidance_scale = 4.5
     # batch size (per GPU!) to use for sampling.
     sample.train_batch_size = 1
     sample.num_image_per_prompt = 1
@@ -60,6 +64,10 @@ def get_config():
     sample.noise_level = 0.7
     # Whether to use the same noise for the same prompt
     sample.same_latent = False
+    # sde window size
+    sample.sde_window_size = 2
+    # sde window range
+    sample.sde_window_range = (0, 10)
     
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
