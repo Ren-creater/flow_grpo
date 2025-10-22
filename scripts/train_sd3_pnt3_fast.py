@@ -17,14 +17,17 @@ from diffusers import StableDiffusion3Pipeline
 from omegaconf import OmegaConf, DictConfig
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../TPDM/src")))
-from models.stable_diffusion_3.modeling_sd3_pnt import init_time_predictor
+from models.stable_diffusion_3.modeling_sd3_pnt import init_time_predictor, reshape_hidden_states_to_2d
 from models.reference_distributions import get_ref_beta
 from diffusers.utils.torch_utils import is_compiled_module
 import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.diffusers_patch.sd3_pnt_pipeline_with_logprob_fast import pipeline_with_logprob
+from flow_grpo.diffusers_patch.sd3_pnt_pipeline_with_logprob_fast import (
+    pipeline_with_logprob,
+    _decode_latents_for_time_predictor,
+)
 from flow_grpo.diffusers_patch.sd3_pnt_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
@@ -192,270 +195,156 @@ def create_generator(prompts, base_seed):
 
         
 def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask=None):
-    # Set up scheduler state for sde_step_with_logprob
     current_batch_size = sample["latents"].shape[0]
-    current_timesteps = sample["timesteps"][:, j]  # timesteps for step j across current batch
-    current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
-    next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
-    
-    # Ensure all tensors are on the correct device
     device = sample["latents"].device
-    current_timesteps = current_timesteps.to(device)
-    current_sigmas = current_sigmas.to(device)
-    next_sigmas = next_sigmas.to(device)
-    
-    # Create the scheduler state that sde_step_with_logprob expects
+
+    # Gather tensors for the current and next timesteps
+    current_latents = sample["latents"][:, j].to(device)
+    next_latents = sample["latents"][:, j + 1].to(device)
+    current_timesteps = sample["timesteps"][:, j].to(device)
+    current_sigmas = sample["sigmas"][:, j].to(device)
+    next_sigmas_target = sample["sigmas"][:, j + 1].to(device)
+
+    # Prepare scheduler state expected by sde_step_with_logprob
     pipeline.scheduler.index_for_timestep = [{} for _ in range(current_batch_size)]
-    
     n = 2
-    # Set up the mapping for the current timestep
     for batch_idx in range(current_batch_size):
-        timestep_val = current_timesteps[batch_idx].item()
-        pipeline.scheduler.index_for_timestep[batch_idx][timestep_val] = n
-    
-    # Set up sigmas list where sigmas[step][batch_idx] gives the sigma value
-    # We need at least steps j and j+1, plus sigma[1] for sigma_max
+        pipeline.scheduler.index_for_timestep[batch_idx][current_timesteps[batch_idx].item()] = n
+
     max_step = max(n + 1, 1)
     pipeline.scheduler.sigmas = [torch.zeros(current_batch_size, device=device) for _ in range(max_step + 1)]
     pipeline.scheduler.sigmas[n] = current_sigmas
-    pipeline.scheduler.sigmas[n + 1] = next_sigmas
-    
-    # Extract sigma_max: prefer sample['sigma_max'] if pipeline provided it (fast pipeline now returns it)
     pipeline.scheduler.sigmas[1] = sample["sigma_max"].to(device)
-    
-    # Debug: Check transformer inputs for NaN/Inf
-    if torch.isnan(sample["latents"][:, j]).any() or torch.isinf(sample["latents"][:, j]).any():
-        logger.warning(f"NaN/Inf detected in transformer input latents at timestep {j}: {sample['latents'][:, j].isnan().sum()} NaNs, {sample['latents'][:, j].isinf().sum()} Infs")
-    if torch.isnan(sample["timesteps"][:, j]).any() or torch.isinf(sample["timesteps"][:, j]).any():
-        logger.warning(f"NaN/Inf detected in transformer input timesteps at timestep {j}: {sample['timesteps'][:, j]}")
-    if torch.isnan(embeds).any() or torch.isinf(embeds).any():
-        logger.warning(f"NaN/Inf detected in transformer input embeds at timestep {j}: {embeds.isnan().sum()} NaNs, {embeds.isinf().sum()} Infs")
-    if torch.isnan(pooled_embeds).any() or torch.isinf(pooled_embeds).any():
-        logger.warning(f"NaN/Inf detected in transformer input pooled_embeds at timestep {j}: {pooled_embeds.isnan().sum()} NaNs, {pooled_embeds.isinf().sum()} Infs")
-    
+
+    # Handle per-step active mask
+    if per_step_active_mask is None:
+        per_step_active_mask = torch.ones(current_batch_size, dtype=torch.bool, device=device)
+    else:
+        per_step_active_mask = per_step_active_mask.to(device)
+
+    # Safety checks for transformer inputs
+
+    # Forward pass through the diffusion transformer, retaining auxiliary features for the time predictor
     if config.train.cfg:
-        noise_pred = transformer(
-            hidden_states=torch.cat([sample["latents"][:, j]] * 2),
-            timestep=torch.cat([sample["timesteps"][:, j]] * 2),
+        transformer_outputs = transformer(
+            hidden_states=torch.cat([current_latents] * 2),
+            timestep=torch.cat([current_timesteps] * 2),
             encoder_hidden_states=embeds,
             pooled_projections=pooled_embeds,
             return_dict=False,
-        )[0]
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = (
-            noise_pred_uncond
-            + config.sample.guidance_scale
-            * (noise_pred_text - noise_pred_uncond)
         )
     else:
-        noise_pred = transformer(
-            hidden_states=sample["latents"][:, j],
-            timestep=sample["timesteps"][:, j],
+        transformer_outputs = transformer(
+            hidden_states=current_latents,
+            timestep=current_timesteps,
             encoder_hidden_states=embeds,
             pooled_projections=pooled_embeds,
             return_dict=False,
-        )[0]
-    
-    # Debug: Check noise prediction for NaN/Inf
-    if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
-        logger.warning(f"NaN/Inf detected in noise_pred at timestep {j}: {noise_pred.isnan().sum()} NaNs, {noise_pred.isinf().sum()} Infs")
-        logger.warning(f"noise_pred stats: min={noise_pred.min()}, max={noise_pred.max()}, mean={noise_pred.mean()}")
-    
-    # Debug: Check inputs to sde_step_with_logprob
-    current_timesteps = sample["timesteps"][:, j]
-    current_latents = sample["latents"][:, j].float()
-    next_latents = sample["latents"][:, j+1].float()  # Use index-based access instead of separate tensor
-    
-    if torch.isnan(current_timesteps).any() or torch.isinf(current_timesteps).any():
-        logger.warning(f"NaN/Inf detected in current_timesteps at timestep {j}: {current_timesteps}")
-    if torch.isnan(current_latents).any() or torch.isinf(current_latents).any():
-        logger.warning(f"NaN/Inf detected in current_latents at timestep {j}: {current_latents.isnan().sum()} NaNs, {current_latents.isinf().sum()} Infs")
-    if torch.isnan(next_latents).any() or torch.isinf(next_latents).any():
-        logger.warning(f"NaN/Inf detected in next_latents at timestep {j}: {next_latents.isnan().sum()} NaNs, {next_latents.isinf().sum()} Infs")
-    
-    # Ensure per-step active mask is available and on device
-    if per_step_active_mask is None:
-        per_step_active_mask = torch.ones(current_batch_size, dtype=torch.bool, device=device)
-    else:
-        per_step_active_mask = per_step_active_mask.to(device)
+        )
 
-    # compute the log prob of next_latents given latents under the current model
-    prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
-        pipeline.scheduler,
-        noise_pred.float(),
-        current_timesteps,
-        current_latents,
-        prev_sample=next_latents,
-        noise_level=config.sample.noise_level,
-        active_mask=per_step_active_mask,
-    )
-    
-    # Debug: Check outputs from sde_step_with_logprob for NaN/Inf
-    if torch.isnan(log_prob).any() or torch.isinf(log_prob).any():
-        logger.warning(f"NaN/Inf detected in diffusion log_prob at timestep {j}: {log_prob}")
-        logger.warning(f"diffusion log_prob stats: min={log_prob.min()}, max={log_prob.max()}, mean={log_prob.mean()}")
-        # Temporary fix: replace NaN values with a default value to prevent training crash
-        log_prob = torch.where(torch.isnan(log_prob) | torch.isinf(log_prob), 
-                              torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype), 
-                              log_prob)
-        logger.warning(f"Replaced NaN/Inf in diffusion log_prob with zeros")
-    if prev_sample_mean is not None and (torch.isnan(prev_sample_mean).any() or torch.isinf(prev_sample_mean).any()):
-        logger.warning(f"NaN/Inf detected in prev_sample_mean at timestep {j}: {prev_sample_mean.isnan().sum()} NaNs, {prev_sample_mean.isinf().sum()} Infs")
-        # Temporary fix: replace NaN values to prevent training crash
-        prev_sample_mean = torch.where(torch.isnan(prev_sample_mean) | torch.isinf(prev_sample_mean),
-                                     torch.tensor(0.0, device=prev_sample_mean.device, dtype=prev_sample_mean.dtype),
-                                     prev_sample_mean)
-        logger.warning(f"Replaced NaN/Inf in prev_sample_mean with zeros")
-    if std_dev_t is not None and (torch.isnan(std_dev_t).any() or torch.isinf(std_dev_t).any()):
-        logger.warning(f"NaN/Inf detected in std_dev_t at timestep {j}: {std_dev_t}")
+    noise_pred, temb, hidden_states_1, hidden_states_2 = transformer_outputs
 
-    return prev_sample, log_prob, prev_sample_mean, std_dev_t
+    if config.train.cfg:
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + config.sample.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-def compute_time_predictor_log_prob(pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask=None):
-    """
-    Compute the log probability of the time predictor for step j.
-    This function uses the saved hidden states and temporal embeddings to recompute
-    the time predictor logprob for a specific sigma transition.
-    """
-    current_batch_size = sample["latents"].shape[0]
-    device = sample["latents"].device
-    
-    # Get current and next sigmas for this timestep
-    current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
-    next_sigmas = sample["sigmas"][:, j + 1]       # sigmas for step j+1 across current batch
-    
-    # Debug: Check sigma inputs for NaN/Inf
-    if torch.isnan(current_sigmas).any() or torch.isinf(current_sigmas).any():
-        logger.warning(f"NaN/Inf detected in current_sigmas at timestep {j}: {current_sigmas}")
-    if torch.isnan(next_sigmas).any() or torch.isinf(next_sigmas).any():
-        logger.warning(f"NaN/Inf detected in next_sigmas at timestep {j}: {next_sigmas}")
-    
-    # Use stored hidden states and temporal embeddings from the sampling phase
-    # Move to device only once and reuse
-    hidden_states_combined = sample["hidden_states_combineds"][:, j]
-    temb = sample["tembs"][:, j]
-    
-    # Move to GPU only if not already there, and convert dtype efficiently
-    if hidden_states_combined.device != device:
-        hidden_states_combined = hidden_states_combined.to(device, dtype=torch.float32, non_blocking=True)
+        temb_uncond, temb_text = temb.chunk(2)
+        temb = temb_uncond + config.sample.guidance_scale * (temb_text - temb_uncond)
+
+        hidden_states_1_uncond, hidden_states_1_text = hidden_states_1.chunk(2)
+        hidden_states_1 = hidden_states_1_uncond + config.sample.guidance_scale * (
+            hidden_states_1_text - hidden_states_1_uncond
+        )
+        hidden_states_2_uncond, hidden_states_2_text = hidden_states_2.chunk(2)
+        hidden_states_2 = hidden_states_2_uncond + config.sample.guidance_scale * (
+            hidden_states_2_text - hidden_states_2_uncond
+        )
+
+    # Prepare inputs for the time predictor
+    if getattr(pipeline, "uses_image_time_predictor", False):
+        time_predictor_inputs = _decode_latents_for_time_predictor(pipeline, current_latents)
     else:
-        hidden_states_combined = hidden_states_combined.to(dtype=torch.float32)
-        
-    if temb.device != device:
-        temb = temb.to(device, dtype=torch.float32, non_blocking=True)
-    else:
-        temb = temb.to(dtype=torch.float32)
-    
-    # Debug: Check inputs to time predictor for NaN/Inf
-    if torch.isnan(hidden_states_combined).any() or torch.isinf(hidden_states_combined).any():
-        logger.warning(f"NaN/Inf detected in hidden_states_combined at timestep {j}: {hidden_states_combined.isnan().sum()} NaNs, {hidden_states_combined.isinf().sum()} Infs")
-    if torch.isnan(temb).any() or torch.isinf(temb).any():
-        logger.warning(f"NaN/Inf detected in temb at timestep {j}: {temb.isnan().sum()} NaNs, {temb.isinf().sum()} Infs")
-    
-    # Call the time predictor to get alpha and beta
+        hidden_states_1 = reshape_hidden_states_to_2d(hidden_states_1)
+        hidden_states_2 = reshape_hidden_states_to_2d(hidden_states_2)
+        time_predictor_inputs = torch.cat([hidden_states_1, hidden_states_2], dim=1)
+
     if pipeline.use_vit_predictor:
-        time_preds = pipeline.time_predictor(hidden_states_combined, temb, embeds)
+        prompt_embeds_for_time_predictor = sample["prompt_embeds"]
+        if prompt_embeds_for_time_predictor.device != device:
+            prompt_embeds_for_time_predictor = prompt_embeds_for_time_predictor.to(
+                device, dtype=time_predictor_inputs.dtype, non_blocking=True
+            )
+        else:
+            prompt_embeds_for_time_predictor = prompt_embeds_for_time_predictor.to(
+                dtype=time_predictor_inputs.dtype
+            )
+        time_preds = pipeline.time_predictor(time_predictor_inputs, temb, prompt_embeds_for_time_predictor)
     else:
-        time_preds = pipeline.time_predictor(hidden_states_combined, temb)
-    
-    # Check time_preds for NaN before processing
-    for i, (param1, param2) in enumerate(time_preds):
-        if torch.isnan(param1).any() or torch.isinf(param1).any():
-            logger.warning(f"NaN/Inf detected in time_predictor param1 for sample {i}: {param1}")
-        if torch.isnan(param2).any() or torch.isinf(param2).any():
-            logger.warning(f"NaN/Inf detected in time_predictor param2 for sample {i}: {param2}")
-    
-    # Prepare per-step active mask
-    if per_step_active_mask is None:
-        per_step_active_mask = torch.ones(current_batch_size, dtype=torch.bool, device=device)
-    else:
-        per_step_active_mask = per_step_active_mask.to(device)
+        time_preds = pipeline.time_predictor(time_predictor_inputs, temb)
 
-    # Build list of log probabilities and construct final tensor from gradient-enabled tensors
-    log_probs_list = []
-    
-    for i, (param1, param2) in enumerate(time_preds):
-        # Skip log prob computation if sample is inactive or sigma is below threshold
-        if (not per_step_active_mask[i]) or (current_sigmas[i] < pipeline.min_sigma):
-            # Use a zero tensor that maintains gradients from time_preds
-            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
-            log_probs_list.append(zero_logprob)
+    sigma_next_pred = current_sigmas.clone()
+    time_predictor_log_probs = torch.zeros_like(current_sigmas)
+
+    for idx, (param1, param2) in enumerate(time_preds):
+        if (not per_step_active_mask[idx]) or (current_sigmas[idx] < pipeline.min_sigma):
+            zero_logprob = param1 * 0.0
+            time_predictor_log_probs[idx] = zero_logprob
+            sigma_next_pred[idx] = current_sigmas[idx]
             continue
-            
+
         if pipeline.prediction_type == "alpha_beta":
             alpha, beta = param1, param2
         elif pipeline.prediction_type == "mode_concentration":
             alpha = param1 * (param2 - 2) + 1
             beta = (1 - param1) * (param2 - 2) + 1
-        
-        # Debug: Check alpha and beta calculation
-        if torch.isnan(alpha) or torch.isinf(alpha):
-            logger.warning(f"NaN/Inf in alpha for sample {i}: alpha={alpha}, param1={param1}, param2={param2}")
-        if torch.isnan(beta) or torch.isinf(beta):
-            logger.warning(f"NaN/Inf in beta for sample {i}: beta={beta}, param1={param1}, param2={param2}")
-        
-        # Validate alpha and beta parameters before creating Beta distribution
+        else:
+            raise ValueError(f"Unsupported prediction type: {pipeline.prediction_type}")
+
         alpha = torch.clamp(alpha, min=1e-6)
         beta = torch.clamp(beta, min=1e-6)
-        
-        # Check for any invalid values in parameters
-        if torch.isnan(alpha) or torch.isinf(alpha) or torch.isnan(beta) or torch.isinf(beta):
-            # Use a zero tensor that maintains gradients from time_preds
-            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
-            log_probs_list.append(zero_logprob)
-            continue
-        
-        # Validate sigma values before ratio calculation
-        if torch.isnan(current_sigmas[i]) or torch.isinf(current_sigmas[i]) or \
-           torch.isnan(next_sigmas[i]) or torch.isinf(next_sigmas[i]) or \
-           current_sigmas[i] <= 0:
-            # Use a zero tensor that maintains gradients from time_preds
-            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
-            log_probs_list.append(zero_logprob)
-            continue
-        
+
         beta_dist = torch.distributions.Beta(alpha, beta)
-        
-        # Calculate the ratio from the stored sigmas
+
         if pipeline.relative:
-            ratio = next_sigmas[i] / current_sigmas[i]
+            valid_sigma = current_sigmas[idx].abs().clamp_min(pipeline.epsilon)
+            ratio_target = (next_sigmas_target[idx] / valid_sigma).clamp(
+                pipeline.epsilon, 1 - pipeline.epsilon
+            )
         else:
-            ratio = current_sigmas[i] - next_sigmas[i]
-        
-        # Debug: log sigma values and ratio calculation
-        if torch.isnan(ratio) or torch.isinf(ratio):
-            logger.warning(f"NaN/Inf ratio calculation detected for sample {i}:")
-            logger.warning(f"  current_sigmas[{i}]: {current_sigmas[i]}")
-            logger.warning(f"  next_sigmas[{i}]: {next_sigmas[i]}")
-            logger.warning(f"  pipeline.relative: {pipeline.relative}")
-            logger.warning(f"  ratio: {ratio}")
-        
-        # Clamp ratio and check for NaN/inf
-        ratio = torch.clamp(ratio, min=pipeline.epsilon, max=1 - pipeline.epsilon)
-        if torch.isnan(ratio) or torch.isinf(ratio):
-            logger.warning(f"NaN/Inf in ratio after clamping for sample {i}: {ratio}")
-            # Use a zero tensor that maintains gradients from time_preds
-            zero_logprob = param1 * 0.0  # This maintains gradients from the time predictor
-            log_probs_list.append(zero_logprob)
-            continue
-        
-        # Compute the log probability
-        time_predictor_log_prob = beta_dist.log_prob(ratio)
-        
-        # Debug: check for NaN in log probability computation
-        if torch.isnan(time_predictor_log_prob) or torch.isinf(time_predictor_log_prob):
-            logger.warning(f"NaN/Inf in beta distribution log_prob for sample {i}:")
-            logger.warning(f"  alpha: {alpha}")
-            logger.warning(f"  beta: {beta}")
-            logger.warning(f"  ratio: {ratio}")
-            logger.warning(f"  log_prob: {time_predictor_log_prob}")
-        
-        log_probs_list.append(time_predictor_log_prob)
-    
-    # Stack all log probabilities into a single tensor that maintains gradients
-    time_predictor_log_probs = torch.stack(log_probs_list, dim=0)
-    
-    return time_predictor_log_probs
+            ratio_target = (current_sigmas[idx] - next_sigmas_target[idx]).clamp(
+                pipeline.epsilon, 1 - pipeline.epsilon
+            )
+
+        ratio_pred = torch.clamp(beta_dist.mean, min=pipeline.epsilon, max=1 - pipeline.epsilon)
+        ratio = ratio_pred + (ratio_target - ratio_pred).detach()
+
+        if pipeline.relative:
+            sigma_next_pred[idx] = current_sigmas[idx] * ratio
+        else:
+            sigma_next_pred[idx] = current_sigmas[idx] - ratio
+
+        time_predictor_log_probs[idx] = beta_dist.log_prob(ratio_target)
+
+    pipeline.scheduler.sigmas[n + 1] = sigma_next_pred
+
+    # Debug: Check noise prediction for NaN/Inf
+
+    # Prepare inputs for diffusion logprob computation
+    current_latents_float = current_latents.float()
+    next_latents_float = next_latents.float()
+
+    prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
+        pipeline.scheduler,
+        noise_pred.float(),
+        current_timesteps,
+        current_latents_float,
+        prev_sample=next_latents_float,
+        noise_level=config.sample.noise_level,
+        active_mask=per_step_active_mask,
+    )
+
+    return prev_sample, diffusion_log_prob, time_predictor_log_probs, prev_sample_mean, std_dev_t
+
 
 def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config):
     """
@@ -469,7 +358,7 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
     current_sigmas = sample["sigmas"][:, j]        # sigmas for step j across current batch
     
     # Use stored hidden states and temporal embeddings from the sampling phase
-    # Optimize tensor transfers similar to compute_time_predictor_log_prob
+    # Optimize tensor transfers similar to compute_log_prob
     hidden_states_combined = sample["hidden_states_combineds"][:, j]
     temb = sample["tembs"][:, j]
     
@@ -889,11 +778,10 @@ def main(_):
     if config.train.use_8bit_adam:
         try:
             import bitsandbytes as bnb
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
-
+            ) from exc
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
@@ -1620,42 +1508,85 @@ def main(_):
                                 per_step_active_mask = torch.ones(sample["latents"].shape[0], dtype=torch.bool, device=accelerator.device)
 
                             if not is_time_predictor_only_phase:
-                                # Full joint training: compute both diffusion and time predictor logprobs
-                                prev_sample, diffusion_log_prob, prev_sample_mean, std_dev_t = compute_log_prob(
-                                    transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                                # Full joint or diffusion-only training: compute joint log probabilities
+                                (
+                                    _,
+                                    diffusion_log_prob,
+                                    time_predictor_log_prob,
+                                    prev_sample_mean,
+                                    std_dev_t,
+                                ) = compute_log_prob(
+                                    transformer,
+                                    pipeline,
+                                    sample,
+                                    j,
+                                    embeds,
+                                    pooled_embeds,
+                                    config,
+                                    per_step_active_mask,
                                 )
+
                                 if config.train.beta > 0:
                                     with torch.no_grad():
                                         with transformer.module.disable_adapter():
-                                            _, _, prev_sample_mean_ref, _ = compute_log_prob(
-                                                transformer, pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
+                                            (
+                                                _,
+                                                _,
+                                                _,
+                                                prev_sample_mean_ref,
+                                                _,
+                                            ) = compute_log_prob(
+                                                transformer,
+                                                pipeline,
+                                                sample,
+                                                j,
+                                                embeds,
+                                                pooled_embeds,
+                                                config,
+                                                per_step_active_mask,
                                             )
                             else:
-                                # Time predictor only: skip diffusion logprob computation for efficiency
+                                # Time predictor only: reuse compute_log_prob to obtain predictor logprob while ignoring diffusion output
+                                (
+                                    _,
+                                    _,
+                                    time_predictor_log_prob,
+                                    _,
+                                    _,
+                                ) = compute_log_prob(
+                                    transformer,
+                                    pipeline,
+                                    sample,
+                                    j,
+                                    embeds,
+                                    pooled_embeds,
+                                    config,
+                                    per_step_active_mask,
+                                )
                                 diffusion_log_prob = torch.zeros_like(sample["log_probs"][:, j])
                                 prev_sample_mean = None
                                 std_dev_t = None
                                 prev_sample_mean_ref = None
-                            
+
                             if freeze_time_predictor:
                                 time_predictor_log_prob = torch.zeros_like(sample["log_probs"][:, j])
                                 time_predictor_kl_div = None
                             else:
-                                # Always compute time predictor logprobs when the predictor is trainable
-                                time_predictor_log_prob = compute_time_predictor_log_prob(
-                                    pipeline, sample, j, embeds, pooled_embeds, config, per_step_active_mask
-                                )
-
                                 # Check for NaN/Inf in time predictor component before combining
                                 if torch.isnan(time_predictor_log_prob).any() or torch.isinf(time_predictor_log_prob).any():
-                                    logger.warning(f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}")
-                                    logger.warning(f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}")
+                                    logger.warning(
+                                        f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}"
+                                    )
+                                    logger.warning(
+                                        f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, "
+                                        f"max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}"
+                                    )
 
                                 # Compute time predictor KL divergence for regularization
                                 if config.train.time_predictor_kl_weight > 0:
                                     time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
                                 else:
-                                    time_predictor_kl_div = None
+                                    time_predictor_kl_div = None                                
 
                             # Check for NaN/Inf in diffusion component before combining
                             if not is_time_predictor_only_phase:

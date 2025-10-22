@@ -111,6 +111,7 @@ def get_config():
     # Note: You can use the same optimizer for both phases - PyTorch will automatically
     # skip gradients for frozen parameters. No need for separate optimizers.
     train.time_predictor_only_epochs = 0
+    train.time_predictor_kl_weight = 0
 
     ###### Prompt Function ######
     # prompt function to use. see `prompts.py` for available prompt functions.

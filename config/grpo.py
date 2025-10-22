@@ -1268,7 +1268,7 @@ def pickscore_sd3_fast_2gpu():
     # sd3.5 medium
     config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
     config.sample.num_steps = 10
-    config.sample.train_num_steps = 2
+    config.sample.train_num_steps = 10
     config.sample.eval_num_steps = 40
     config.sample.guidance_scale = 4.5
 
@@ -1338,7 +1338,8 @@ def pickscore_sd3_5_pnt_vit_fast_2gpu_t():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors")
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-16/sd35_vit_captions_20251016_115614/checkpoint-100/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors"
     #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
@@ -1356,8 +1357,7 @@ def pickscore_sd3_5_pnt_vit_fast_2gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors")
-    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-16/sd35_vit_captions_20251016_115614/checkpoint-100/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
     config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit.yaml")
@@ -1374,8 +1374,7 @@ def pickscore_sd3_5_pnt_vit_fast_2gpu_frozen():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-10/sd35_vit_captions_20251010_132250/checkpoint-200/model.safetensors")
-    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-16/sd35_vit_captions_20251016_115614/checkpoint-100/model.safetensors")
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit'
     config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit.yaml")
@@ -1393,8 +1392,8 @@ def pickscore_sd3_5_pnt_vit_image_fast_2gpu():
     config.sample.num_steps = 50
     config.sample.eval_num_steps = 50
     # sd3.5 medium - local path
-    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-02/sd35_vit_image_captions_20251002_180553/checkpoint-300/model.safetensors")
-    #"~/flow_grpo/TPDM/outputs/2025-09-27/sd35_vit_pnt_pickscore_hx1_20250927_182440/checkpoint-200/model.safetensors")
+    config.sd3_checkpoint_path = os.path.expanduser("~/flow_grpo/TPDM/outputs/2025-10-16/sd35_vit_captions_20251016_115614/checkpoint-100/model.safetensors")
+    #"~/flow_grpo/TPDM/outputs/2025-10-15/sd35_vit_captions_20251015_171455/checkpoint-100/model.safetensors"
     config.pretrained.model = os.path.expanduser("~/flow_grpo/stable-diffusion-3.5-medium")
     config.save_dir = 'logs/pickscore/sd3-5-M-pnt-vit-image'
     config.time_predictor_config_path = os.path.expanduser("~/flow_grpo/TPDM/configs/models/sd35_pnt_vit_image.yaml")

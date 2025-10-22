@@ -137,7 +137,7 @@ def pipeline_with_logprob(
 
     random.seed(process_index)
     if random_timestep is None:
-        random_timestep = random.randint(0, sample_num_steps//random.randint(2,4))
+        random_timestep = random.randint(0, sample_num_steps//random.randint(1,4))
 
     # 6. Prepare image embeddings
     all_latents = []
