@@ -3,7 +3,7 @@
 # - It uses the patched version of `sde_step_with_logprob` from `sd3_pnt_sde_with_logprob.py`.
 # - It returns all the intermediate latents of the denoising process as well as the log probs of each denoising step.
 # - Adapted to work with SD3PredictNextTimeStepModel instead of StableDiffusion3Pipeline
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import random
@@ -72,6 +72,9 @@ def pipeline_with_logprob(
     process_index: int = 0,
     sample_num_steps: int = 10,
     random_timestep: Optional[int] = None,
+    sde_window_size: Optional[int] = None,
+    sde_window_range: Optional[Tuple[int, int]] = None,
+    sde_type: Optional[str] = "sde",
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -135,9 +138,21 @@ def pipeline_with_logprob(
     # 5. Initialize timestep prediction variables
     sigma = torch.ones(batch_size, dtype=latents.dtype, device=device)
 
+    # Determine effective training window length
+    use_sde_window = sde_window_size is not None and sde_window_size > 0
+    effective_train_steps = sde_window_size if use_sde_window else train_num_steps
+    effective_train_steps = max(int(effective_train_steps), 1)
+
     random.seed(process_index)
-    if random_timestep is None:
-        random_timestep = random.randint(0, sample_num_steps//random.randint(1,4))
+    if use_sde_window:
+        window_start_min, window_start_max = sde_window_range or (0, sample_num_steps)
+        window_start_max = max(window_start_min, window_start_max - effective_train_steps)
+        if random_timestep is None:
+            random_timestep = random.randint(window_start_min, window_start_max)
+    else:
+        if random_timestep is None:
+            max_start = max(sample_num_steps - effective_train_steps, 0)
+            random_timestep = random.randint(0, max_start) if max_start > 0 else 0
 
     # 6. Prepare image embeddings
     all_latents = []
@@ -154,7 +169,7 @@ def pipeline_with_logprob(
     step_counts = torch.zeros_like(sigma, dtype=torch.float32, device=device)
 
     # Force samples to stay active (at least at min_sigma) for the early portion of the training window
-    force_active_until_step = min(num_inference_steps, random_timestep + train_num_steps)
+    force_active_until_step = min(num_inference_steps, random_timestep + effective_train_steps)
     
     # Clear and initialize scheduler for batched timesteps/sigmas
     self.scheduler.timesteps = []
@@ -196,7 +211,7 @@ def pipeline_with_logprob(
             # Update scheduler for new batch size
             self.scheduler.index_for_timestep = [{} for _ in range(len(latents))]
             all_latents.append(latents)
-        elif step > random_timestep and step < random_timestep + train_num_steps:
+        elif step > random_timestep and step < random_timestep + effective_train_steps:
             cur_noise_level = noise_level
         else:
             cur_noise_level = 0
@@ -240,7 +255,7 @@ def pipeline_with_logprob(
             time_predictor_inputs = torch.cat([hidden_states_1, hidden_states_2], dim=1)
         
         # Store hidden states and temporal embeddings only for training window
-        if step >= random_timestep and step < random_timestep + train_num_steps:
+        if step >= random_timestep and step < random_timestep + effective_train_steps:
             stored_inputs = time_predictor_inputs.detach()
             all_hidden_states_combineds.append(stored_inputs.half().cpu())
             all_tembs.append(temb.detach().half().cpu())
@@ -301,10 +316,11 @@ def pipeline_with_logprob(
             latents.float(),
             noise_level=cur_noise_level,
             active_mask=active_mask,
+            sde_type=sde_type,
         )
         
         # Store results only for training window
-        if step >= random_timestep and step < random_timestep + train_num_steps:
+        if step >= random_timestep and step < random_timestep + effective_train_steps:
             all_latents.append(latents)
             all_log_probs.append(log_prob)
             all_time_predictor_log_probs.append(step_time_predictor_log_probs)
@@ -312,7 +328,7 @@ def pipeline_with_logprob(
             all_sigmas_per_step.append(sigma.clone())
             # store active mask for this step so training can ignore inactive samples
             all_active_masks.append(active_mask.clone())
-        elif step == random_timestep + train_num_steps:
+        elif step == random_timestep + effective_train_steps:
             all_sigmas_per_step.append(sigma.clone())
             
         sigma = sigma_next
