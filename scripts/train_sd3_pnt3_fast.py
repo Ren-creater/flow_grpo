@@ -346,6 +346,87 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     return prev_sample, diffusion_log_prob, time_predictor_log_probs, prev_sample_mean, std_dev_t
 
 
+def compute_time_predictor_log_prob_from_cache(
+    pipeline,
+    sample,
+    j,
+    config,
+    per_step_active_mask=None,
+):
+    device = sample["latents"].device
+    dtype = next(pipeline.time_predictor.parameters()).dtype
+
+    current_sigmas = sample["sigmas"][:, j].to(device)
+    next_sigmas_target = sample["sigmas"][:, j + 1].to(device)
+
+    hidden_states_combined = sample["hidden_states_combineds"][:, j]
+    if hidden_states_combined.device != device:
+        hidden_states_combined = hidden_states_combined.to(device, dtype=dtype, non_blocking=True)
+    else:
+        hidden_states_combined = hidden_states_combined.to(dtype=dtype)
+
+    temb = sample["tembs"][:, j]
+    if temb.device != device:
+        temb = temb.to(device, dtype=dtype, non_blocking=True)
+    else:
+        temb = temb.to(dtype=dtype)
+
+    if pipeline.use_vit_predictor:
+        prompt_embeds_for_time_predictor = sample["prompt_embeds"]
+        if prompt_embeds_for_time_predictor.device != device:
+            prompt_embeds_for_time_predictor = prompt_embeds_for_time_predictor.to(
+                device, dtype=dtype, non_blocking=True
+            )
+        else:
+            prompt_embeds_for_time_predictor = prompt_embeds_for_time_predictor.to(dtype=dtype)
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb, prompt_embeds_for_time_predictor)
+    else:
+        time_preds = pipeline.time_predictor(hidden_states_combined, temb)
+
+    if per_step_active_mask is None:
+        per_step_active_mask = torch.ones(current_sigmas.shape[0], dtype=torch.bool, device=device)
+    else:
+        per_step_active_mask = per_step_active_mask.to(device)
+
+    time_predictor_log_probs = torch.zeros_like(current_sigmas)
+
+    for idx, (param1, param2) in enumerate(time_preds):
+        if (not per_step_active_mask[idx]) or (current_sigmas[idx] < pipeline.min_sigma):
+            zero_logprob = param1 * 0.0
+            time_predictor_log_probs[idx] = zero_logprob
+            continue
+
+        if pipeline.prediction_type == "alpha_beta":
+            alpha, beta = param1, param2
+        elif pipeline.prediction_type == "mode_concentration":
+            alpha = param1 * (param2 - 2) + 1
+            beta = (1 - param1) * (param2 - 2) + 1
+        else:
+            raise ValueError(f"Unsupported prediction type: {pipeline.prediction_type}")
+
+        alpha = torch.clamp(alpha, min=1e-6)
+        beta = torch.clamp(beta, min=1e-6)
+
+        beta_dist = torch.distributions.Beta(alpha, beta)
+
+        if pipeline.relative:
+            valid_sigma = current_sigmas[idx].abs().clamp_min(pipeline.epsilon)
+            ratio_target = (next_sigmas_target[idx] / valid_sigma).clamp(
+                pipeline.epsilon, 1 - pipeline.epsilon
+            )
+        else:
+            ratio_target = (current_sigmas[idx] - next_sigmas_target[idx]).clamp(
+                pipeline.epsilon, 1 - pipeline.epsilon
+            )
+
+        ratio_pred = torch.clamp(beta_dist.mean, min=pipeline.epsilon, max=1 - pipeline.epsilon)
+        ratio = ratio_pred + (ratio_target - ratio_pred).detach()
+
+        time_predictor_log_probs[idx] = beta_dist.log_prob(ratio_target)
+
+    return time_predictor_log_probs
+
+
 def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config):
     """
     Compute the KL divergence between the time predictor's predicted Beta distribution
@@ -408,7 +489,7 @@ def compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_emb
             # Use the get_ref_beta function to get reference alpha/beta based on current sigma
             # Reshape sigma for get_ref_beta function (expects 1D tensor)
             sigma_input = current_sigmas[i:i+1]  # Shape: (1,)
-            ref_alpha, ref_beta = get_ref_beta(sigma_input)
+            ref_alpha, ref_beta = get_ref_beta(sigma_input, config.sample.num_steps)
             ref_alpha, ref_beta = ref_alpha[0], ref_beta[0]  # Extract scalar values
         else:
             # Use fixed reference distribution for non-relative case
@@ -1561,20 +1642,11 @@ def main(_):
                                                 per_step_active_mask,
                                             )
                             else:
-                                # Time predictor only: reuse compute_log_prob to obtain predictor logprob while ignoring diffusion output
-                                (
-                                    _,
-                                    _,
-                                    time_predictor_log_prob,
-                                    _,
-                                    _,
-                                ) = compute_log_prob(
-                                    transformer,
+                                # Time predictor only: reuse cached hidden states to avoid building a diffusion graph
+                                time_predictor_log_prob = compute_time_predictor_log_prob_from_cache(
                                     pipeline,
                                     sample,
                                     j,
-                                    embeds,
-                                    pooled_embeds,
                                     config,
                                     per_step_active_mask,
                                 )
