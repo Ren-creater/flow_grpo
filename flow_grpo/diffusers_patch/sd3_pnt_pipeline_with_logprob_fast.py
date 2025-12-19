@@ -225,8 +225,8 @@ def pipeline_with_logprob(
         (noise_pred, temb, hidden_states_1, hidden_states_2) = self.transformer(
             hidden_states=latent_model_input,
             timestep=timestep.repeat(2) if self.do_classifier_free_guidance else timestep,
-            encoder_hidden_states=tem_prompt_embeds,
-            pooled_projections=tem_pooled_prompt_embeds,
+            encoder_hidden_states=prompt_embeds if not self.do_classifier_free_guidance else tem_prompt_embeds,
+            pooled_projections=pooled_prompt_embeds if not self.do_classifier_free_guidance else tem_pooled_prompt_embeds,
             joint_attention_kwargs=self.joint_attention_kwargs,
             return_dict=False,
         )
