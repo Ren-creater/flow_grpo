@@ -167,9 +167,6 @@ def pipeline_with_logprob(
     # Track which samples remain active and how many denoising steps each one performs
     active_mask = torch.ones_like(sigma, dtype=torch.bool, device=device)
     step_counts = torch.zeros_like(sigma, dtype=torch.float32, device=device)
-
-    # Force samples to stay active (at least at min_sigma) for the early portion of the training window
-    force_active_until_step = min(num_inference_steps, random_timestep + effective_train_steps)
     
     # Clear and initialize scheduler for batched timesteps/sigmas
     self.scheduler.timesteps = []
@@ -270,6 +267,13 @@ def pipeline_with_logprob(
         step_time_predictor_log_probs = torch.zeros_like(sigma)
         
         for i, (param1, param2) in enumerate(time_preds):
+            # If this sample is already inactive (or already below min_sigma), do not advance it.
+            if (not active_mask[i]) or (sigma[i] < self.min_sigma):
+                sigma_next[i] = sigma[i]
+                step_time_predictor_log_probs[i] = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
+                active_mask[i] = False
+                continue
+
             if self.prediction_type == "alpha_beta":
                 alpha, beta = param1, param2
             elif self.prediction_type == "mode_concentration":
@@ -289,15 +293,13 @@ def pipeline_with_logprob(
             time_predictor_log_prob = beta_dist.log_prob(ratio)
             step_time_predictor_log_probs[i] = time_predictor_log_prob
             
-            # Check if this sample should stop
-            if sigma[i] < self.min_sigma or sigma_next[i] < self.min_sigma:
-                force_keep_active = step < force_active_until_step
-                if force_keep_active:
-                    sigma_next[i] = torch.as_tensor(self.min_sigma, device=sigma_next.device, dtype=sigma_next.dtype)
-                    active_mask[i] = True
-                else:
-                    sigma_next[i] = torch.zeros((), device=sigma_next.device, dtype=sigma_next.dtype)
-                    active_mask[i] = False
+            # Stop denoising if the next sigma would fall below the minimum.
+            # Keep sigma constant for inactive samples to avoid scheduler edge cases;
+            # downstream training uses `active_mask` to ignore these steps.
+            if sigma_next[i] < self.min_sigma:
+                sigma_next[i] = sigma[i]
+                step_time_predictor_log_probs[i] = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
+                active_mask[i] = False
 
     # Update scheduler state for this timestep
         self.scheduler.timesteps.append(timestep.clone())
