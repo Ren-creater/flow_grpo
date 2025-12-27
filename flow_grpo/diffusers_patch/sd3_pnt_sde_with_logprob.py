@@ -99,9 +99,8 @@ def sde_step_with_logprob(
             print("Warning: Invalid ratio_term for sqrt:", ratio_term.flatten())
 
         std_dev_t = torch.sqrt(ratio_term) * noise_level
-        std_dev_t = torch.clamp(std_dev_t, min=1e-6)
 
-        safe_sigma = torch.clamp(sigma, min=1e-8)
+        safe_sigma = sigma
         prev_sample_mean = sample * (1 + std_dev_t**2 / (2 * safe_sigma) * dt) + model_output * (
             1 + std_dev_t**2 * (1 - sigma) / (2 * safe_sigma)
         ) * dt
@@ -116,12 +115,8 @@ def sde_step_with_logprob(
             prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
 
         sqrt_neg_dt = torch.sqrt(-1 * dt)
-        if torch.isnan(sqrt_neg_dt).any() or torch.isinf(sqrt_neg_dt).any():
-            dt = torch.clamp(dt, max=-1e-8)
-            sqrt_neg_dt = torch.sqrt(-1 * dt)
 
         variance_term = std_dev_t * sqrt_neg_dt
-        variance_term = torch.clamp(variance_term, min=1e-8)
 
         log_prob = (
             -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (variance_term**2))
@@ -130,11 +125,10 @@ def sde_step_with_logprob(
         )
     elif sde_type == "cps":
         std_dev_t = sigma_prev * math.sin(noise_level * math.pi / 2)
-        std_dev_t = torch.clamp(std_dev_t, min=1e-8)
 
         pred_original_sample = sample - sigma * model_output
         noise_estimate = sample + model_output * (1 - sigma)
-        sqrt_term = torch.sqrt(torch.clamp(sigma_prev**2 - std_dev_t**2, min=1e-8))
+        sqrt_term = torch.sqrt(sigma_prev**2 - std_dev_t**2)
         prev_sample_mean = pred_original_sample * (1 - sigma_prev) + noise_estimate * sqrt_term
 
         if prev_sample is None:
