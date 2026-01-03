@@ -705,7 +705,11 @@ def main(_):
     accelerator_kwargs = {
         "mixed_precision": config.mixed_precision,
         "project_config": accelerator_config,
-        "gradient_accumulation_steps": config.train.gradient_accumulation_steps * num_train_timesteps,
+        # IMPORTANT:
+        # Gradient accumulation is counted per *outer* training iteration (one `accelerator.accumulate(...)` block).
+        # In this script's training loop we accumulate once per trajectory/batch, not once per timestep.
+        # Therefore we should NOT multiply by `num_train_timesteps` here.
+        "gradient_accumulation_steps": config.train.gradient_accumulation_steps,
     }
     
     # Determine if we need to enable find_unused_parameters for DDP
@@ -731,7 +735,7 @@ def main(_):
     accelerator_kwargs["mixed_precision"] = config.mixed_precision
     accelerator_kwargs["project_config"] = accelerator_config
     accelerator_kwargs["gradient_accumulation_steps"] = (
-        config.train.gradient_accumulation_steps * num_train_timesteps
+        config.train.gradient_accumulation_steps
     )
 
     accelerator = Accelerator(**accelerator_kwargs)
@@ -1592,40 +1596,253 @@ def main(_):
                 log_dtype = sample["log_probs"].dtype
                 device = accelerator.device
 
-                current_log_prob_sum = torch.zeros(batch_size, device=device, dtype=log_dtype)
-                reference_log_prob_sum = torch.zeros_like(current_log_prob_sum)
-                advantages_sum = torch.zeros_like(current_log_prob_sum)
-                active_mask_sum = torch.zeros_like(current_log_prob_sum)
+                def _get_per_step_active_mask(sample_dict, step_idx: int) -> torch.Tensor:
+                    if "active_masks" in sample_dict and sample_dict["active_masks"].numel() != 0:
+                        return sample_dict["active_masks"][:, step_idx].to(accelerator.device)
+                    return torch.ones(sample_dict["latents"].shape[0], dtype=torch.bool, device=accelerator.device)
 
-                log_prob_diff_sq_sum = torch.zeros_like(current_log_prob_sum)
+                # ------------------------------
+                # Two-pass objective to avoid retaining activations over all timesteps.
+                # Pass 1 (no_grad): compute trajectory-level ratio/clipping decision + logging stats.
+                # Pass 2 (grad): per-timestep backward of a surrogate whose gradient matches PPO w/ trajectory ratio.
+                # ------------------------------
 
-                diffusion_log_prob_sum = torch.zeros_like(current_log_prob_sum)
-                time_predictor_log_prob_sum = torch.zeros_like(current_log_prob_sum)
+                with accelerator.accumulate(transformer):
+                    # Save RNG state so the two-pass recomputation uses identical stochastic masks
+                    # (e.g., dropout) in pass-1 and pass-2. Without this, ratio/clipping decisions can be
+                    # computed from different stochastic forward outputs than the ones used for gradients,
+                    # which increases variance and can look like numerical instability/collapse.
+                    rng_state_cpu = torch.random.get_rng_state()
+                    rng_state_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-                diffusion_kl_sum = torch.zeros_like(current_log_prob_sum)
-                time_predictor_kl_sum = torch.zeros_like(current_log_prob_sum)
-                time_predictor_kl_max = torch.full(
-                    (batch_size,), float("-inf"), device=device, dtype=log_dtype
-                )
+                    # ---- Pass 1: compute ratio and masks without gradient ----
+                    # Use the same autocast policy as the gradient pass to keep numerics consistent.
+                    with torch.no_grad(), autocast():
+                        current_log_prob_sum_ng = torch.zeros(batch_size, device=device, dtype=log_dtype)
+                        reference_log_prob_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        advantages_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        active_mask_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        log_prob_diff_sq_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
 
-                for j in tqdm(
-                    range(num_train_timesteps),
-                    desc="Timestep",
-                    position=1,
-                    leave=False,
-                    disable=not accelerator.is_local_main_process,
-                ):
-                    with accelerator.accumulate(transformer):
-                        with autocast():
-                            
-                            # extract per-step active mask if available
-                            if "active_masks" in sample and sample["active_masks"].numel() != 0:
-                                per_step_active_mask = sample["active_masks"][:, j].to(accelerator.device)
-                            else:
-                                per_step_active_mask = torch.ones(sample["latents"].shape[0], dtype=torch.bool, device=accelerator.device)
+                        diffusion_log_prob_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        time_predictor_log_prob_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+
+                        diffusion_kl_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        time_predictor_kl_sum_ng = torch.zeros_like(current_log_prob_sum_ng)
+                        time_predictor_kl_max_ng = torch.full(
+                            (batch_size,), float("-inf"), device=device, dtype=log_dtype
+                        )
+
+                        for j in range(num_train_timesteps):
+                            per_step_active_mask = _get_per_step_active_mask(sample, j)
+                            active_mask_float = per_step_active_mask.to(dtype=log_dtype)
 
                             if not is_time_predictor_only_phase:
-                                # Full joint or diffusion-only training: compute joint log probabilities
+                                (
+                                    _,
+                                    diffusion_log_prob_ng,
+                                    time_predictor_log_prob_ng,
+                                    prev_sample_mean_ng,
+                                    std_dev_t_ng,
+                                ) = compute_log_prob(
+                                    transformer,
+                                    pipeline,
+                                    sample,
+                                    j,
+                                    embeds,
+                                    pooled_embeds,
+                                    config,
+                                    per_step_active_mask,
+                                )
+
+                                prev_sample_mean_ref_ng = None
+                                if config.train.beta > 0:
+                                    with transformer.module.disable_adapter():
+                                        (
+                                            _,
+                                            _,
+                                            _,
+                                            prev_sample_mean_ref_ng,
+                                            _,
+                                        ) = compute_log_prob(
+                                            transformer,
+                                            pipeline,
+                                            sample,
+                                            j,
+                                            embeds,
+                                            pooled_embeds,
+                                            config,
+                                            per_step_active_mask,
+                                        )
+                            else:
+                                time_predictor_log_prob_ng = compute_time_predictor_log_prob_from_cache(
+                                    pipeline,
+                                    sample,
+                                    j,
+                                    config,
+                                    per_step_active_mask,
+                                )
+                                diffusion_log_prob_ng = torch.zeros_like(sample["log_probs"][:, j])
+                                prev_sample_mean_ng = None
+                                std_dev_t_ng = None
+                                prev_sample_mean_ref_ng = None
+
+                            if freeze_time_predictor:
+                                time_predictor_log_prob_ng = torch.zeros_like(sample["log_probs"][:, j])
+                                time_predictor_kl_div_ng = None
+                            else:
+                                if config.train.time_predictor_kl_weight > 0:
+                                    time_predictor_kl_div_ng = compute_time_predictor_kl_divergence(
+                                        pipeline, sample, j, embeds, pooled_embeds, config
+                                    )
+                                else:
+                                    time_predictor_kl_div_ng = None
+
+                            # Combine logprobs as in the original objective.
+                            if is_time_predictor_only_phase:
+                                current_log_prob_ng = time_predictor_log_prob_ng
+                                reference_log_prob_ng = sample["time_predictor_log_probs"][:, j]
+                            elif freeze_time_predictor:
+                                current_log_prob_ng = diffusion_log_prob_ng
+                                reference_log_prob_ng = sample["log_probs"][:, j]
+                            else:
+                                current_log_prob_ng = diffusion_log_prob_ng + time_predictor_log_prob_ng
+                                reference_log_prob_ng = sample["log_probs"][:, j] + sample["time_predictor_log_probs"][:, j]
+
+                            advantages_ng = torch.clamp(
+                                sample["advantages"][:, j].to(log_dtype),
+                                -config.train.adv_clip_max,
+                                config.train.adv_clip_max,
+                            )
+
+                            current_log_prob_sum_ng = current_log_prob_sum_ng + current_log_prob_ng * active_mask_float
+                            reference_log_prob_sum_ng = reference_log_prob_sum_ng + reference_log_prob_ng * active_mask_float
+                            advantages_sum_ng = advantages_sum_ng + advantages_ng * active_mask_float
+                            active_mask_sum_ng = active_mask_sum_ng + active_mask_float
+                            log_prob_diff_sq_sum_ng = log_prob_diff_sq_sum_ng + (
+                                (current_log_prob_ng - reference_log_prob_ng) ** 2 * active_mask_float
+                            )
+
+                            if not is_time_predictor_only_phase:
+                                diffusion_log_prob_sum_ng = diffusion_log_prob_sum_ng + diffusion_log_prob_ng * active_mask_float
+                            if not freeze_time_predictor or is_time_predictor_only_phase:
+                                time_predictor_log_prob_sum_ng = (
+                                    time_predictor_log_prob_sum_ng + time_predictor_log_prob_ng * active_mask_float
+                                )
+
+                            if config.train.beta > 0 and not is_time_predictor_only_phase:
+                                if prev_sample_mean_ref_ng is not None:
+                                    kl_loss_ng = ((prev_sample_mean_ng - prev_sample_mean_ref_ng) ** 2).mean(
+                                        dim=(1, 2, 3), keepdim=True
+                                    ) / (2 * std_dev_t_ng ** 2)
+                                    diffusion_kl_sum_ng = diffusion_kl_sum_ng + kl_loss_ng.squeeze() * active_mask_float
+
+                            if (
+                                config.train.time_predictor_kl_weight > 0
+                                and not freeze_time_predictor
+                                and time_predictor_kl_div_ng is not None
+                            ):
+                                time_predictor_kl_sum_ng = time_predictor_kl_sum_ng + time_predictor_kl_div_ng * active_mask_float
+                                masked_tp_kl = torch.where(
+                                    per_step_active_mask,
+                                    time_predictor_kl_div_ng,
+                                    torch.full_like(time_predictor_kl_div_ng, float("-inf")),
+                                )
+                                time_predictor_kl_max_ng = torch.maximum(time_predictor_kl_max_ng, masked_tp_kl)
+
+                        log_prob_diff_sum = current_log_prob_sum_ng - reference_log_prob_sum_ng
+                        ratio = torch.exp(log_prob_diff_sum)
+                        ratio_clipped = torch.clamp(
+                            ratio,
+                            1.0 - config.train.clip_range,
+                            1.0 + config.train.clip_range,
+                        )
+
+                        advantages_scaled = advantages_sum_ng / float(num_train_steps)
+
+                        unclipped_loss = -advantages_scaled * ratio
+                        clipped_loss = -advantages_scaled * ratio_clipped
+                        per_sample_policy_loss = torch.maximum(unclipped_loss, clipped_loss)
+                        policy_loss_value = torch.mean(per_sample_policy_loss)
+
+                        # For the clipped PPO objective, gradient is zero where the clipped branch is strictly selected.
+                        grad_mask = (unclipped_loss >= clipped_loss).to(dtype=log_dtype)
+
+                        # This coefficient multiplies sum_j ∇ log π_j.
+                        # It is treated as a constant during backprop to avoid holding a full trajectory graph.
+                        policy_grad_coef = (-advantages_scaled) * ratio * grad_mask
+
+                        diffusion_kl_loss_value = None
+                        if config.train.beta > 0 and not is_time_predictor_only_phase:
+                            diffusion_kl_loss_value = torch.mean(diffusion_kl_sum_ng / float(num_train_steps))
+
+                        time_predictor_kl_loss_value = None
+                        if config.train.time_predictor_kl_weight > 0 and not freeze_time_predictor:
+                            time_predictor_kl_loss_value = torch.mean(time_predictor_kl_sum_ng / float(num_train_steps))
+
+                        total_active = torch.sum(active_mask_sum_ng)
+                        if total_active <= 0:
+                            total_active = torch.tensor(1.0, device=active_mask_sum_ng.device)
+
+                        # Populate logging info from the no_grad pass.
+                        info["approx_kl"].append(0.5 * torch.sum(log_prob_diff_sq_sum_ng) / total_active)
+                        clip_mask = (torch.abs(ratio - 1.0) > config.train.clip_range).float() * active_mask_sum_ng
+                        info["clipfrac"].append(torch.sum(clip_mask) / total_active)
+                        clip_mask_gt = ((ratio - 1.0) > config.train.clip_range).float() * active_mask_sum_ng
+                        info["clipfrac_gt_one"].append(torch.sum(clip_mask_gt) / total_active)
+                        clip_mask_lt = ((1.0 - ratio) > config.train.clip_range).float() * active_mask_sum_ng
+                        info["clipfrac_lt_one"].append(torch.sum(clip_mask_lt) / total_active)
+                        info["policy_loss"].append(policy_loss_value)
+
+                        if diffusion_kl_loss_value is not None:
+                            info["diffusion_kl_loss"].append(diffusion_kl_loss_value)
+                        if time_predictor_kl_loss_value is not None:
+                            info["time_predictor_kl_loss"].append(time_predictor_kl_loss_value)
+                            info["time_predictor_kl_div_mean"].append(torch.sum(time_predictor_kl_sum_ng) / total_active)
+                            if (time_predictor_kl_max_ng > float("-inf")).any():
+                                info["time_predictor_kl_div_max"].append(
+                                    torch.where(
+                                        time_predictor_kl_max_ng > float("-inf"),
+                                        time_predictor_kl_max_ng,
+                                        torch.zeros_like(time_predictor_kl_max_ng),
+                                    ).max()
+                                )
+                            else:
+                                info["time_predictor_kl_div_max"].append(
+                                    torch.tensor(0.0, device=log_prob_diff_sq_sum_ng.device, dtype=log_dtype)
+                                )
+                        if not is_time_predictor_only_phase:
+                            info["diffusion_log_prob_mean"].append(torch.sum(diffusion_log_prob_sum_ng) / total_active)
+                        if not freeze_time_predictor or is_time_predictor_only_phase:
+                            info["time_predictor_log_prob_mean"].append(torch.sum(time_predictor_log_prob_sum_ng) / total_active)
+                        info["combined_log_prob_mean"].append(torch.sum(current_log_prob_sum_ng) / total_active)
+
+                        loss_value = policy_loss_value
+                        if diffusion_kl_loss_value is not None:
+                            loss_value = loss_value + config.train.beta * diffusion_kl_loss_value
+                        if time_predictor_kl_loss_value is not None:
+                            loss_value = loss_value + config.train.time_predictor_kl_weight * time_predictor_kl_loss_value
+                        info["loss"].append(loss_value)
+
+                    # Restore RNG state so pass-2 sees the same stochastic forward masks as pass-1.
+                    torch.random.set_rng_state(rng_state_cpu)
+                    if rng_state_cuda is not None:
+                        torch.cuda.set_rng_state_all(rng_state_cuda)
+
+                    # ---- Pass 2: per-timestep backward without retaining full-trajectory activations ----
+                    optimizer.zero_grad()
+                    for j in tqdm(
+                        range(num_train_timesteps),
+                        desc="Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not accelerator.is_local_main_process,
+                    ):
+                        per_step_active_mask = _get_per_step_active_mask(sample, j)
+                        active_mask_float = per_step_active_mask.to(dtype=log_dtype)
+
+                        with autocast():
+                            if not is_time_predictor_only_phase:
                                 (
                                     _,
                                     diffusion_log_prob,
@@ -1643,6 +1860,7 @@ def main(_):
                                     per_step_active_mask,
                                 )
 
+                                prev_sample_mean_ref = None
                                 if config.train.beta > 0:
                                     with torch.no_grad():
                                         with transformer.module.disable_adapter():
@@ -1663,7 +1881,6 @@ def main(_):
                                                 per_step_active_mask,
                                             )
                             else:
-                                # Time predictor only: reuse compute_log_prob to obtain predictor logprob while ignoring diffusion output
                                 time_predictor_log_prob = compute_time_predictor_log_prob_from_cache(
                                     pipeline,
                                     sample,
@@ -1680,223 +1897,73 @@ def main(_):
                                 time_predictor_log_prob = torch.zeros_like(sample["log_probs"][:, j])
                                 time_predictor_kl_div = None
                             else:
-                                # Check for NaN/Inf in time predictor component before combining
-                                if torch.isnan(time_predictor_log_prob).any() or torch.isinf(time_predictor_log_prob).any():
-                                    logger.warning(
-                                        f"NaN/Inf detected in time_predictor_log_prob component: {time_predictor_log_prob}"
-                                    )
-                                    logger.warning(
-                                        f"time_predictor_log_prob stats: min={time_predictor_log_prob.min()}, "
-                                        f"max={time_predictor_log_prob.max()}, mean={time_predictor_log_prob.mean()}"
-                                    )
-
-                                # Compute time predictor KL divergence for regularization
                                 if config.train.time_predictor_kl_weight > 0:
-                                    time_predictor_kl_div = compute_time_predictor_kl_divergence(pipeline, sample, j, embeds, pooled_embeds, config)
+                                    time_predictor_kl_div = compute_time_predictor_kl_divergence(
+                                        pipeline, sample, j, embeds, pooled_embeds, config
+                                    )
                                 else:
-                                    time_predictor_kl_div = None                                
+                                    time_predictor_kl_div = None
 
-                            # Check for NaN/Inf in diffusion component before combining
-                            if not is_time_predictor_only_phase:
-                                if torch.isnan(diffusion_log_prob).any() or torch.isinf(diffusion_log_prob).any():
-                                    logger.warning(f"NaN/Inf detected in diffusion_log_prob component: {diffusion_log_prob}")
-                                    logger.warning(f"diffusion_log_prob stats: min={diffusion_log_prob.min()}, max={diffusion_log_prob.max()}, mean={diffusion_log_prob.mean()}")
+                            # Combine logprobs as in the original objective.
+                            if is_time_predictor_only_phase:
+                                current_log_prob = time_predictor_log_prob
+                            elif freeze_time_predictor:
+                                current_log_prob = diffusion_log_prob
+                            else:
+                                current_log_prob = diffusion_log_prob + time_predictor_log_prob
 
-                        # Create mask for active samples at this timestep (use per_step_active_mask)
-                        active_mask_float = per_step_active_mask.to(dtype=log_dtype)
-                        
-                        # Combine logprobs: diffusion logprobs + time predictor logprobs
-                        if is_time_predictor_only_phase:
-                            # In time_predictor-only phase: only use time predictor logprobs
-                            # Since diffusion model is frozen, diffusion logprobs cancel out in the ratio
-                            current_log_prob = time_predictor_log_prob
-                            reference_log_prob = sample["time_predictor_log_probs"][:, j] 
-                            
-                            # Check reference time predictor log probs
-                            if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
-                                logger.warning(f"NaN/Inf detected in reference time_predictor_log_probs: {reference_log_prob}")
-                                logger.warning(f"reference time_predictor_log_probs stats: min={reference_log_prob.min()}, max={reference_log_prob.max()}, mean={reference_log_prob.mean()}")
-                        elif freeze_time_predictor:
-                            # With a frozen time predictor we only optimize the diffusion policy
-                            current_log_prob = diffusion_log_prob
-                            reference_log_prob = sample["log_probs"][:, j]
+                            # Surrogate whose gradient matches: ∇L = (-A_scaled) * mask * ∇r,
+                            # with ∇r = r * Σ_j active_j ∇ log π_j.
+                            policy_step_loss = torch.mean(
+                                policy_grad_coef.detach() * (current_log_prob * active_mask_float)
+                            )
 
-                            if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
-                                logger.warning(
-                                    f"NaN/Inf detected in reference diffusion log_probs: {sample['log_probs'][:, j]}"
+                            step_loss = policy_step_loss
+
+                            if config.train.beta > 0 and (not is_time_predictor_only_phase):
+                                if prev_sample_mean_ref is not None:
+                                    kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(
+                                        dim=(1, 2, 3), keepdim=True
+                                    ) / (2 * std_dev_t ** 2)
+                                    diffusion_kl_step = torch.mean((kl_loss.squeeze() * active_mask_float)) / float(
+                                        num_train_steps
+                                    )
+                                    step_loss = step_loss + config.train.beta * diffusion_kl_step
+
+                            if (
+                                config.train.time_predictor_kl_weight > 0
+                                and not freeze_time_predictor
+                                and time_predictor_kl_div is not None
+                            ):
+                                tp_kl_step = torch.mean((time_predictor_kl_div * active_mask_float)) / float(
+                                    num_train_steps
                                 )
-                                logger.warning(
-                                    f"reference diffusion log_probs stats: min={sample['log_probs'][:, j].min()}, max={sample['log_probs'][:, j].max()}, mean={sample['log_probs'][:, j].mean()}"
-                                )
+                                step_loss = step_loss + config.train.time_predictor_kl_weight * tp_kl_step
+
+                        if torch.isnan(step_loss) or torch.isinf(step_loss):
+                            logger.warning(
+                                f"NaN/Inf detected in per-step loss at j={j}: {step_loss}. Skipping backward for this timestep."
+                            )
+                            continue
+
+                        # IMPORTANT: When `accelerator.sync_gradients` is True, DDP would normally all-reduce
+                        # gradients on *every* backward call. Since we do multiple backwards per batch (one per
+                        # timestep), we explicitly suppress gradient synchronization for all but the last timestep.
+                        should_suppress_sync = accelerator.sync_gradients and (j != num_train_timesteps - 1)
+                        if should_suppress_sync:
+                            with contextlib.ExitStack() as stack:
+                                stack.enter_context(accelerator.no_sync(transformer))
+                                if not freeze_time_predictor:
+                                    stack.enter_context(accelerator.no_sync(pipeline.time_predictor))
+                                accelerator.backward(step_loss)
                         else:
-                            # In joint training: combine both logprobs
-                            current_log_prob = diffusion_log_prob + time_predictor_log_prob
-                            reference_log_prob = sample["log_probs"][:, j] + sample["time_predictor_log_probs"][:, j]
-                            
-                            # Check reference log probs components
-                            if torch.isnan(sample["log_probs"][:, j]).any() or torch.isinf(sample["log_probs"][:, j]).any():
-                                logger.warning(f"NaN/Inf detected in reference diffusion log_probs: {sample['log_probs'][:, j]}")
-                                logger.warning(f"reference diffusion log_probs stats: min={sample['log_probs'][:, j].min()}, max={sample['log_probs'][:, j].max()}, mean={sample['log_probs'][:, j].mean()}")
-                            
-                            if torch.isnan(sample["time_predictor_log_probs"][:, j]).any() or torch.isinf(sample["time_predictor_log_probs"][:, j]).any():
-                                logger.warning(f"NaN/Inf detected in reference time_predictor_log_probs: {sample['time_predictor_log_probs'][:, j]}")
-                                logger.warning(f"reference time_predictor_log_probs stats: min={sample['time_predictor_log_probs'][:, j].min()}, max={sample['time_predictor_log_probs'][:, j].max()}, mean={sample['time_predictor_log_probs'][:, j].mean()}")
-                        
-                        # Check for NaN/Inf in log probabilities
-                        if torch.isnan(current_log_prob).any() or torch.isinf(current_log_prob).any():
-                            logger.warning(f"NaN/Inf detected in current_log_prob: {current_log_prob.mean()}")
-                        if torch.isnan(reference_log_prob).any() or torch.isinf(reference_log_prob).any():
-                            logger.warning(f"NaN/Inf detected in reference_log_prob: {reference_log_prob.mean()}")
-                        
-                        # Cache per-timestep tensors so we can aggregate probabilities after the rollout.
-                        advantages = torch.clamp(
-                            sample["advantages"][:, j].to(log_dtype),
-                            -config.train.adv_clip_max,
-                            config.train.adv_clip_max,
-                        )
-                        current_log_prob_sum = current_log_prob_sum + current_log_prob * active_mask_float
-                        reference_log_prob_sum = reference_log_prob_sum + reference_log_prob * active_mask_float
-                        advantages_sum = advantages_sum + advantages * active_mask_float
-                        active_mask_sum = active_mask_sum + active_mask_float
-                        log_prob_diff_sq_sum = log_prob_diff_sq_sum + (
-                            (current_log_prob - reference_log_prob) ** 2 * active_mask_float
-                        )
+                            accelerator.backward(step_loss)
 
-                        if not is_time_predictor_only_phase:
-                            diffusion_log_prob_sum = diffusion_log_prob_sum + diffusion_log_prob * active_mask_float
-                        if not freeze_time_predictor or is_time_predictor_only_phase:
-                            time_predictor_log_prob_sum = (
-                                time_predictor_log_prob_sum + time_predictor_log_prob * active_mask_float
-                            )
-                        
-                        if config.train.beta > 0 and not is_time_predictor_only_phase:
-                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1, 2, 3), keepdim=True) / (2 * std_dev_t ** 2)
-                            diffusion_kl_sum = diffusion_kl_sum + kl_loss.squeeze() * active_mask_float
-                        
-                        if (
-                            config.train.time_predictor_kl_weight > 0
-                            and not freeze_time_predictor
-                        ):
-                            if time_predictor_kl_div is not None:
-                                time_predictor_kl_sum = time_predictor_kl_sum + time_predictor_kl_div * active_mask_float
-                                masked_tp_kl = torch.where(
-                                    per_step_active_mask,
-                                    time_predictor_kl_div,
-                                    torch.full_like(time_predictor_kl_div, float("-inf")),
-                                )
-                                time_predictor_kl_max = torch.maximum(time_predictor_kl_max, masked_tp_kl)
-                            else:
-                                time_predictor_kl_sum = time_predictor_kl_sum + torch.zeros_like(current_log_prob)
-                        
-                        # Wait until the final timestep before forming PPO ratios so the ratio uses summed log probabilities.
-                        if j != num_train_timesteps - 1:
-                            continue
-                        
-                        log_prob_diff_sum = current_log_prob_sum - reference_log_prob_sum
-                        ratio = torch.exp(log_prob_diff_sum)
-                        if torch.isnan(ratio).any() or torch.isinf(ratio).any():
-                            logger.warning(
-                                f"NaN/Inf detected in aggregated ratio: {ratio.mean()}, log_diff_sum: {log_prob_diff_sum.mean()}"
-                            )
-                        
-                        ratio_clipped = torch.clamp(
-                            ratio,
-                            1.0 - config.train.clip_range,
-                            1.0 + config.train.clip_range,
-                        )
-                        
-                        advantages_scaled = advantages_sum / float(num_train_steps)
-                        
-                        unclipped_loss = -advantages_scaled * ratio
-                        clipped_loss = -advantages_scaled * ratio_clipped
-                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                        
-                        if torch.isnan(policy_loss) or torch.isinf(policy_loss):
-                            logger.warning(
-                                f"NaN/Inf detected in policy_loss: {policy_loss}, advantages_scaled: {advantages_scaled.mean()}, ratio: {ratio.mean()}"
-                            )
-                            policy_loss = torch.tensor(0.0, device=policy_loss.device, requires_grad=True)
-                        
-                        loss = policy_loss
-                        
-                        diffusion_kl_loss = None
-                        if config.train.beta > 0 and not is_time_predictor_only_phase:
-                            diffusion_kl_loss = torch.mean(diffusion_kl_sum / float(num_train_steps))
-                            if torch.isnan(diffusion_kl_loss) or torch.isinf(diffusion_kl_loss):
-                                logger.warning(
-                                    f"NaN/Inf detected in diffusion_kl_loss: {diffusion_kl_loss}, diffusion_kl_sum: {diffusion_kl_sum.mean()}"
-                                )
-                                diffusion_kl_loss = torch.tensor(0.0, device=diffusion_kl_sum.device, requires_grad=True)
-                            loss = loss + config.train.beta * diffusion_kl_loss
-                        
-                        time_predictor_kl_loss = None
-                        if (
-                            config.train.time_predictor_kl_weight > 0
-                            and not freeze_time_predictor
-                        ):
-                            time_predictor_kl_loss = torch.mean(time_predictor_kl_sum / float(num_train_steps))
-                            if torch.isnan(time_predictor_kl_loss) or torch.isinf(time_predictor_kl_loss):
-                                logger.warning(
-                                    f"NaN/Inf detected in time_predictor_kl_loss: {time_predictor_kl_loss}, time_predictor_kl_sum: {time_predictor_kl_sum.mean()}"
-                                )
-                                time_predictor_kl_loss = torch.tensor(0.0, device=time_predictor_kl_sum.device, requires_grad=True)
-                            loss = loss + config.train.time_predictor_kl_weight * time_predictor_kl_loss
-                        
-                        total_active = torch.sum(active_mask_sum)
-                        if total_active <= 0:
-                            total_active = torch.tensor(1.0, device=active_mask_sum.device)
-                        
-                        info["approx_kl"].append(0.5 * torch.sum(log_prob_diff_sq_sum) / total_active)
-
-                        clip_mask = (torch.abs(ratio - 1.0) > config.train.clip_range).float() * active_mask_sum
-                        info["clipfrac"].append(torch.sum(clip_mask) / total_active)
-
-                        clip_mask_gt = ((ratio - 1.0) > config.train.clip_range).float() * active_mask_sum
-                        info["clipfrac_gt_one"].append(torch.sum(clip_mask_gt) / total_active)
-
-                        clip_mask_lt = ((1.0 - ratio) > config.train.clip_range).float() * active_mask_sum
-                        info["clipfrac_lt_one"].append(torch.sum(clip_mask_lt) / total_active)
-
-                        info["policy_loss"].append(policy_loss)
-                        if diffusion_kl_loss is not None:
-                            info["diffusion_kl_loss"].append(diffusion_kl_loss)
-                        
-                        if time_predictor_kl_loss is not None:
-                            info["time_predictor_kl_loss"].append(time_predictor_kl_loss)
-                            info["time_predictor_kl_div_mean"].append(torch.sum(time_predictor_kl_sum) / total_active)
-                            if (time_predictor_kl_max > float("-inf")).any():
-                                info["time_predictor_kl_div_max"].append(
-                                    torch.where(
-                                        time_predictor_kl_max > float("-inf"),
-                                        time_predictor_kl_max,
-                                        torch.zeros_like(time_predictor_kl_max),
-                                    ).max()
-                                )
-                            else:
-                                info["time_predictor_kl_div_max"].append(
-                                    torch.tensor(0.0, device=log_prob_diff_sq_sum.device, dtype=log_dtype)
-                                )
-
-                        if not is_time_predictor_only_phase:
-                            info["diffusion_log_prob_mean"].append(torch.sum(diffusion_log_prob_sum) / total_active)
-                        if not freeze_time_predictor or is_time_predictor_only_phase:
-                            info["time_predictor_log_prob_mean"].append(torch.sum(time_predictor_log_prob_sum) / total_active)
-
-                        info["combined_log_prob_mean"].append(torch.sum(current_log_prob_sum) / total_active)
-                        info["loss"].append(loss)
-                        
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            logger.warning(f"NaN/Inf detected in total loss: {loss}. Skipping backward pass for this step.")
-                            continue
-                        
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            current_trainable = get_current_trainable_parameters()
-                            accelerator.clip_grad_norm_(
-                                current_trainable, config.train.max_grad_norm
-                            )
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    if accelerator.sync_gradients:
+                        current_trainable = get_current_trainable_parameters()
+                        accelerator.clip_grad_norm_(current_trainable, config.train.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
